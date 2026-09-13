@@ -17,10 +17,15 @@ export type EngineDefinition = {
    * the engine has no catalog command.
    */
   catalogCommand: string[] | null;
+  /**
+   * When true, the runtime applies the requested model via ACP
+   * `session/set_model` after session creation instead of a spawn arg.
+   */
+  modelViaSetModel?: boolean;
 };
 
-export const CODEX_ACP_PACKAGE = "@zed-industries/codex-acp";
-export const CODEX_ACP_VERSION = "0.16.0";
+export const CODEX_ACP_PACKAGE = "@agentclientprotocol/codex-acp";
+export const CODEX_ACP_VERSION = "1.11.0";
 
 export const ENGINES: Record<EngineId, EngineDefinition> = {
   devin: {
@@ -34,9 +39,9 @@ export const ENGINES: Record<EngineId, EngineDefinition> = {
     id: "codex",
     displayName: "Codex",
     command: "codex-acp",
-    args: ({ model }) =>
-      model ? ["-c", `model=${JSON.stringify(model)}`] : [],
+    args: () => [],
     catalogCommand: null,
+    modelViaSetModel: true,
   },
 };
 

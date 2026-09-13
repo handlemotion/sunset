@@ -1,8 +1,10 @@
 import { execFile } from "node:child_process";
+import { tmpdir } from "node:os";
 
-import type { EngineId, ModelCapability } from "@sunset/domain";
+import type { EngineId, ModelCapability, ModelSelection } from "@sunset/domain";
 
-import { ENGINES } from "./engines.js";
+import { ENGINES, resolveEngineSpawn } from "./engines.js";
+import { stdioConnector } from "./client.js";
 
 const EFFORT = {
   id: "effort",
@@ -12,6 +14,8 @@ const EFFORT = {
     { value: "medium", displayName: "Medium" },
     { value: "high", displayName: "High" },
     { value: "xhigh", displayName: "Extra high" },
+    { value: "max", displayName: "Max" },
+    { value: "ultra", displayName: "Ultra" },
   ],
 };
 
@@ -35,11 +39,26 @@ function codexModel(
   };
 }
 
-// codex-acp 0.16.0 bundles codex ~0.124; models newer than its app-server
-// (gpt-5.6-*, gpt-6-*) are rejected by the API. Keep only verified entries.
+// Fallback when the live catalog probe fails: known codex families with the
+// standard effort ladder. The adapter's session/new response is authoritative.
+const CODEX_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"];
 export const DEFAULT_CODEX_CATALOG: ModelCapability[] = [
-  codexModel("gpt-5.5", "GPT-5.5", true),
+  codexModel("gpt-6-astra", "GPT-6 Astra", true),
+  codexModel("gpt-5.6-sol", "GPT-5.6 Sol"),
+  codexModel("gpt-5.6-terra", "GPT-5.6 Terra"),
+  codexModel("gpt-5.6-luna", "GPT-5.6 Luna"),
+  codexModel("gpt-5.5", "GPT-5.5"),
 ];
+
+/**
+ * Map a Sunset codex selection to the adapter's modelId: `slug[effort]`,
+ * e.g. `codex:gpt-6-astra` + effort `medium` → `gpt-6-astra[medium]`.
+ */
+export function codexModelId(model: ModelSelection): string {
+  const slug = upstreamModelId("codex", model.id);
+  const effort = model.params.find((param) => param.id === "effort")?.value;
+  return effort ? `${slug}[${effort}]` : slug;
+}
 
 /** Strip the `codex:` namespace before passing a model id to the adapter. */
 export function upstreamModelId(engine: EngineId, id: string): string {
@@ -116,8 +135,101 @@ function runCatalogCommand(command: string[]): Promise<string> {
   });
 }
 
+type CodexCatalogEntry = {
+  modelId?: string;
+  name?: string;
+  description?: string;
+};
+
+/** Parse `slug[effort]` model ids into grouped capabilities. */
+function codexCatalog(entries: CodexCatalogEntry[], currentModelId?: string) {
+  const bySlug = new Map<string, { name: string; efforts: string[] }>();
+  for (const entry of entries) {
+    const match = entry.modelId?.match(/^(.+?)\[([a-z]+)\]$/);
+    const slug = match ? match[1]! : entry.modelId;
+    if (!slug) continue;
+    const effort = match?.[2];
+    const name = (entry.name ?? slug).replace(/\s*\([a-z]+\)\s*$/i, "");
+    const group = bySlug.get(slug) ?? { name, efforts: [] };
+    if (effort && !group.efforts.includes(effort)) group.efforts.push(effort);
+    bySlug.set(slug, group);
+  }
+  const currentSlug = currentModelId?.match(/^(.+?)\[/)?.[1] ?? currentModelId;
+  const models: ModelCapability[] = [];
+  for (const [slug, group] of bySlug) {
+    const efforts = group.efforts.length ? group.efforts : CODEX_EFFORTS;
+    models.push({
+      id: `codex:${slug}`,
+      displayName: group.name,
+      aliases: [slug],
+      parameters: [EFFORT],
+      variants: efforts.map((effort) => ({
+        params: [{ id: "effort", value: effort }],
+        displayName: `${group.name} (${effort})`,
+        isDefault: slug === currentSlug,
+      })),
+    });
+  }
+  if (!models.some((model) => model.variants.some((v) => v.isDefault))) {
+    models[0]?.variants.forEach((v, i) => (v.isDefault = i === 0));
+  }
+  return models;
+}
+
+let codexCatalogCache: Promise<ModelCapability[]> | null = null;
+
+/**
+ * Probe the codex adapter for its live catalog — `session/new` returns
+ * `models.availableModels`. Falls back to the static list on any failure.
+ */
+function listCodexModels(): Promise<ModelCapability[]> {
+  codexCatalogCache ??= (async () => {
+    try {
+      const spawn = await resolveEngineSpawn("codex");
+      const conn = await stdioConnector({
+        command: spawn.command,
+        args: spawn.args,
+      })({
+        cwd: tmpdir(),
+        onUpdate: () => undefined,
+        onPermission: async () => ({ outcome: { outcome: "cancelled" } }),
+        onClose: () => undefined,
+      });
+      try {
+        await conn.request("initialize", {
+          protocolVersion: 1,
+          clientCapabilities: {
+            fs: { readTextFile: false, writeTextFile: false },
+            terminal: false,
+          },
+          clientInfo: { name: "sunset", title: "Sunset", version: "0.0.1" },
+        });
+        const created = (await conn.request("session/new", {
+          cwd: tmpdir(),
+          mcpServers: [],
+        })) as {
+          models?: {
+            availableModels?: CodexCatalogEntry[];
+            currentModelId?: string;
+          };
+        };
+        const models = codexCatalog(
+          created.models?.availableModels ?? [],
+          created.models?.currentModelId,
+        );
+        return models.length ? models : DEFAULT_CODEX_CATALOG;
+      } finally {
+        conn.close();
+      }
+    } catch {
+      return DEFAULT_CODEX_CATALOG;
+    }
+  })();
+  return codexCatalogCache;
+}
+
 export async function listModels(engine: EngineId): Promise<ModelCapability[]> {
-  if (engine === "codex") return DEFAULT_CODEX_CATALOG;
+  if (engine === "codex") return listCodexModels();
   const command = ENGINES.devin.catalogCommand;
   if (!command) return DEVIN_FALLBACK;
   const output = await runCatalogCommand(command);

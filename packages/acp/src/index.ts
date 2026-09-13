@@ -8,6 +8,7 @@ export {
 export {
   listModels,
   upstreamModelId,
+  codexModelId,
   DEFAULT_CODEX_CATALOG,
 } from "./catalog.js";
 export { mapSessionUpdate, asAgentEvent } from "./map.js";

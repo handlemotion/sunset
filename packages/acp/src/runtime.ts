@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 
-import type { AgentMode, ModelCapability } from "@sunset/domain";
+import type {
+  AgentMode,
+  ModelCapability,
+  ModelSelection,
+} from "@sunset/domain";
 import { resolveExecutionPolicy } from "@sunset/domain";
 import type {
   RequestPermissionRequest,
@@ -15,7 +19,7 @@ import {
   type AcpConnector,
 } from "./client.js";
 import { resolveEngineSpawn, type EngineDefinition } from "./engines.js";
-import { listModels, upstreamModelId } from "./catalog.js";
+import { codexModelId, listModels, upstreamModelId } from "./catalog.js";
 import { mapSessionUpdate } from "./map.js";
 import type {
   CreateEngineInput,
@@ -154,6 +158,29 @@ function deniedPermission(): RequestPermissionResponse {
   return { outcome: { outcome: "cancelled" } };
 }
 
+async function applyModel(
+  conn: AcpConnectionHandle,
+  sessionId: string,
+  model: ModelSelection,
+): Promise<void> {
+  if (!model.id) return;
+  try {
+    await conn.request("session/set_model", {
+      sessionId,
+      modelId: codexModelId(model),
+    });
+  } catch (error) {
+    // Older adapters without set_model keep their spawn-time default.
+    if (
+      error instanceof Error &&
+      /method not found|unknown method|-32601/i.test(error.message)
+    ) {
+      return;
+    }
+    throw error;
+  }
+}
+
 async function applyMode(
   conn: AcpConnectionHandle,
   sessionId: string,
@@ -269,6 +296,9 @@ export function createEngine(
               cwd: input.cwd,
               mcpServers: [],
             });
+            if (definition.modelViaSetModel) {
+              await applyModel(conn, providerSessionId, input.model);
+            }
             return session;
           } catch {
             // fall through to session/load
@@ -280,6 +310,9 @@ export function createEngine(
             cwd: input.cwd,
             mcpServers: [],
           });
+          if (definition.modelViaSetModel) {
+            await applyModel(conn, providerSessionId, input.model);
+          }
         } catch (error) {
           if (isAuthError(error)) {
             await authenticate();
@@ -289,6 +322,9 @@ export function createEngine(
                 cwd: input.cwd,
                 mcpServers: [],
               });
+              if (definition.modelViaSetModel) {
+                await applyModel(conn, providerSessionId, input.model);
+              }
               return session;
             } catch (retry) {
               conn.close();
@@ -302,6 +338,9 @@ export function createEngine(
             `session_resume_failed:${error instanceof Error ? error.message : "unknown"}`,
           );
         }
+      }
+      if (definition.modelViaSetModel) {
+        await applyModel(conn, providerSessionId, input.model);
       }
       return session;
     }
@@ -323,6 +362,9 @@ export function createEngine(
       })) as { sessionId: string; modes?: SessionModeState };
     }
     session.providerSessionId = created.sessionId;
+    if (definition.modelViaSetModel) {
+      await applyModel(conn, created.sessionId, input.model);
+    }
     await applyMode(conn, created.sessionId, input.mode, created.modes ?? null);
     return session;
   }
