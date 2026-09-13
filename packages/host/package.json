@@ -1,0 +1,39 @@
+{
+  "name": "@sunset/host",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "check-types": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@sunset/acp": "workspace:*",
+    "@sunset/domain": "workspace:*",
+    "@sunset/git": "workspace:*",
+    "better-sqlite3": "^12.2.0",
+    "ulid": "^3.0.1"
+  },
+  "devDependencies": {
+    "@sunset/typescript-config": "workspace:*",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.15.0",
+    "execa": "^9.6.1",
+    "typescript": "5.9.2",
+    "vitest": "3.2.4"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}

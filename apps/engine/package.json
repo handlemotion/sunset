@@ -1,0 +1,25 @@
+{
+  "name": "@sunset/engine",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "check-types": "tsc --noEmit",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "@sunset/box": "workspace:*",
+    "@sunset/publish": "workspace:*"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250617.0",
+    "@sunset/typescript-config": "workspace:*",
+    "typescript": "5.9.2",
+    "wrangler": "^4.20.0"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}

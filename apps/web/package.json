@@ -1,0 +1,29 @@
+{
+  "name": "@sunset/web",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build && tsc --noEmit",
+    "check-types": "tsc --noEmit",
+    "dev": "vite"
+  },
+  "dependencies": {
+    "@sunset/domain": "workspace:*",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@sunset/typescript-config": "workspace:*",
+    "@tailwindcss/vite": "^4.1.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@vitejs/plugin-react": "^4.5.0",
+    "tailwindcss": "^4.1.0",
+    "typescript": "5.9.2",
+    "vite": "^6.3.0"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "name": "@sunset/git",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "check-types": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "execa": "^9.6.0",
+    "p-limit": "^6.2.0",
+    "tinyglobby": "^0.2.14"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@sunset/typescript-config": "workspace:*",
+    "typescript": "5.9.2",
+    "vitest": "3.2.4"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}

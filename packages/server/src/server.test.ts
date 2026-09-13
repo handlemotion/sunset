@@ -1,0 +1,230 @@
+import { describe, expect, it } from "vitest";
+import WebSocket from "ws";
+
+import type { Host, HostEvent } from "@sunset/host";
+
+import { createSunsetServer } from "./server.js";
+
+function stubHost(): Host {
+  const project = { id: "p1", repoRoot: "/tmp/repo" };
+  const workspace = {
+    id: "w1",
+    projectId: "p1",
+    worktreePath: "/tmp/wt",
+    branch: "sunset/w1",
+    slug: "w1",
+    baseRef: "HEAD",
+    createdAt: 0,
+    archivedAt: null,
+  };
+  return {
+    async capabilities() {
+      return { engines: [] };
+    },
+    async close() {},
+    async suspend() {},
+    projects: {
+      async register(repoRoot: string) {
+        return { id: "p1", repoRoot };
+      },
+      get: () => project,
+      list: () => [project],
+      async reconcile() {
+        return {
+          project,
+          repositoryIdentity: null,
+          inspectedAt: 0,
+          entries: [],
+        };
+      },
+    },
+    workspaces: {
+      async create() {
+        return workspace;
+      },
+      list: () => [workspace],
+      get: () => workspace,
+      async archive() {
+        return { ...workspace, archivedAt: 1 };
+      },
+    },
+    sessions: {
+      async create({ prompt }) {
+        return {
+          session: {
+            id: "s1",
+            workspaceId: "w1",
+            engine: "devin" as const,
+            location: "local" as const,
+            providerSessionId: "ps1",
+            mode: "agent" as const,
+            model: { id: "m", params: [] },
+            executionPolicy: {
+              autoReview: false,
+              sandbox: { enabled: false },
+              agentRetries: true,
+              toolAllowlist: null,
+              toolDenylist: [],
+            },
+            createdAt: 0,
+          },
+          run: {
+            id: "r1",
+            sessionId: "s1",
+            status: "queued" as const,
+            createdAt: 0,
+            startedAt: null,
+            finishedAt: null,
+          },
+        };
+      },
+      async send({ prompt }) {
+        return {
+          session: {
+            id: "s1",
+            workspaceId: "w1",
+            engine: "devin" as const,
+            location: "local" as const,
+            providerSessionId: "ps1",
+            mode: "agent" as const,
+            model: { id: "m", params: [] },
+            executionPolicy: {
+              autoReview: false,
+              sandbox: { enabled: false },
+              agentRetries: true,
+              toolAllowlist: null,
+              toolDenylist: [],
+            },
+            createdAt: 0,
+          },
+          run: {
+            id: "r1",
+            sessionId: "s1",
+            status: "queued" as const,
+            createdAt: 0,
+            startedAt: null,
+            finishedAt: null,
+          },
+        };
+      },
+      get: () => undefined,
+      list: () => [],
+    },
+    runs: {
+      get: () => undefined,
+      list: () => [],
+      async wait() {
+        return { runId: "r1", status: "finished" as const, result: "done" };
+      },
+      async cancel() {
+        return { runId: "r1", status: "cancelled" as const };
+      },
+      attach({ afterSequence }) {
+        const events: HostEvent[] = [
+          {
+            type: "text_delta",
+            text: "a",
+            workspaceId: "w1",
+            sessionId: "s1",
+            runId: "r1",
+            sequence: 1,
+          },
+          {
+            type: "text_delta",
+            text: "b",
+            workspaceId: "w1",
+            sessionId: "s1",
+            runId: "r1",
+            sequence: 2,
+          },
+        ];
+        return {
+          async *[Symbol.asyncIterator]() {
+            for (const event of events) {
+              if (event.sequence > (afterSequence ?? 0)) yield event;
+            }
+          },
+        };
+      },
+    },
+    diagnostics: {
+      operations: {
+        get: () => undefined,
+        list: () => [],
+      },
+    },
+  };
+}
+
+describe("createSunsetServer", () => {
+  it("rejects API calls without the boot token and accepts with it", async () => {
+    const server = await createSunsetServer({ host: stubHost() });
+    const unauthorized = await fetch(`${server.url}/api/projects`);
+    expect(unauthorized.status).toBe(401);
+
+    const authorized = await fetch(`${server.url}/api/projects`, {
+      headers: { authorization: `Bearer ${server.token}` },
+    });
+    expect(authorized.status).toBe(200);
+    const body = (await authorized.json()) as { projects: unknown[] };
+    expect(body.projects).toHaveLength(1);
+    await server.close();
+  });
+
+  it("serves REST endpoints for workspaces and sessions", async () => {
+    const server = await createSunsetServer({ host: stubHost() });
+    const headers = { authorization: `Bearer ${server.token}` };
+    const created = await fetch(`${server.url}/api/projects/p1/workspaces`, {
+      method: "POST",
+      headers: { ...headers, "content-type": "application/json" },
+      body: JSON.stringify({ slug: "w1" }),
+    });
+    expect(created.status).toBe(200);
+
+    const session = await fetch(`${server.url}/api/workspaces/w1/sessions`, {
+      method: "POST",
+      headers: { ...headers, "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "hi", engine: "devin" }),
+    });
+    expect(session.status).toBe(200);
+    const parsed = (await session.json()) as { session: { id: string } };
+    expect(parsed.session.id).toBe("s1");
+
+    const cancel = await fetch(`${server.url}/api/runs/r1/cancel`, {
+      method: "POST",
+      headers,
+    });
+    expect(cancel.status).toBe(200);
+    await server.close();
+  });
+
+  it("streams run events over WebSocket and closes at run end", async () => {
+    const server = await createSunsetServer({ host: stubHost() });
+    const ws = new WebSocket(
+      `${server.url.replace("http", "ws")}/api/runs/r1/events?token=${server.token}`,
+    );
+    const received: unknown[] = [];
+    await new Promise<void>((resolve, reject) => {
+      ws.on("message", (data) => received.push(JSON.parse(String(data))));
+      ws.on("close", () => resolve());
+      ws.on("error", reject);
+      setTimeout(() => reject(new Error("ws timeout")), 5000);
+    });
+    expect(received).toHaveLength(2);
+    await server.close();
+  });
+
+  it("rejects WebSocket upgrades without a token", async () => {
+    const server = await createSunsetServer({ host: stubHost() });
+    await expect(
+      new Promise((resolve, reject) => {
+        const ws = new WebSocket(
+          `${server.url.replace("http", "ws")}/api/runs/r1/events`,
+        );
+        ws.on("open", () => resolve(undefined));
+        ws.on("error", (error) => reject(error));
+      }),
+    ).rejects.toThrow();
+    await server.close();
+  });
+});
