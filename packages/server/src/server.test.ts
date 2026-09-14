@@ -5,7 +5,14 @@ import type { Host, HostEvent } from "@sunset/host";
 
 import { createSunsetServer } from "./server.js";
 
-function stubHost(options: { hangAttach?: boolean } = {}): Host {
+function stubHost(
+  options: {
+    hangAttach?: boolean;
+    hangWait?: boolean;
+    waitGate?: Promise<void>;
+    waitStarted?: () => void;
+  } = {},
+): Host {
   const project = { id: "p1", repoRoot: "/tmp/repo" };
   const workspace = {
     id: "w1",
@@ -114,6 +121,10 @@ function stubHost(options: { hangAttach?: boolean } = {}): Host {
       get: () => undefined,
       list: () => [],
       async wait() {
+        if (options.hangWait) {
+          options.waitStarted?.();
+          await options.waitGate;
+        }
         return { runId: "r1", status: "finished" as const, result: "done" };
       },
       async cancel() {
@@ -284,6 +295,7 @@ describe("createSunsetServer", () => {
       body: JSON.stringify({ repoRoot: "/tmp/", pad: "x".repeat(1024 * 1024) }),
     });
     expect(oversized.status).toBe(413);
+    expect(oversized.headers.get("connection")).toBe("close");
 
     const ok = await fetch(`${server.url}/api/projects`, {
       headers: { authorization: `Bearer ${server.token}` },
@@ -310,5 +322,36 @@ describe("createSunsetServer", () => {
     await server.close();
     await closed;
     expect(ws.readyState).toBe(WebSocket.CLOSED);
+  });
+
+  it("aborts a pending HTTP handler when shutdown cannot drain it", async () => {
+    let releaseWait!: () => void;
+    const waitGate = new Promise<void>((resolve) => {
+      releaseWait = resolve;
+    });
+    let resolveWaitStarted!: () => void;
+    const waitStarted = new Promise<void>((resolve) => {
+      resolveWaitStarted = resolve;
+    });
+    const server = await createSunsetServer({
+      host: stubHost({
+        hangWait: true,
+        waitGate,
+        waitStarted: resolveWaitStarted,
+      }),
+    });
+    const pending = fetch(`${server.url}/api/runs/r1/wait`, {
+      headers: { authorization: `Bearer ${server.token}` },
+    });
+    await waitStarted;
+
+    await Promise.race([
+      server.close(),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("shutdown timeout")), 3000),
+      ),
+    ]);
+    releaseWait();
+    await expect(pending).rejects.toThrow();
   });
 });

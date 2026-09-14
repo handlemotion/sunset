@@ -25,6 +25,7 @@ const MIME: Record<string, string> = {
 };
 
 const MAX_BODY_BYTES = 1024 * 1024;
+const SHUTDOWN_DRAIN_TIMEOUT_MS = 1000;
 
 const ALLOWED_ORIGIN_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
@@ -69,6 +70,8 @@ function json(response: ServerResponse, status: number, value: unknown): void {
 
 function fail(response: ServerResponse, error: unknown): void {
   if (error instanceof PayloadTooLargeError) {
+    response.shouldKeepAlive = false;
+    response.setHeader("connection", "close");
     json(response, 413, {
       error: { code: "payload_too_large", message: error.message },
     });
@@ -200,13 +203,14 @@ export async function createSunsetServer(
   }
 
   const inflight = new Set<Promise<void>>();
+  let forcedShutdown = false;
   const server: Server = createHttpServer((request, response) => {
     const startedAt = Date.now();
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
     const method = request.method ?? "GET";
     const pending = handleRequest(request, response, url).catch(
       (error: unknown) => {
-        if (!(error instanceof PayloadTooLargeError)) {
+        if (!forcedShutdown && !(error instanceof PayloadTooLargeError)) {
           log({
             level: "error",
             msg: "handler_error",
@@ -215,20 +219,24 @@ export async function createSunsetServer(
             err: errorMessage(error),
           });
         }
-        fail(response, error);
+        if (!response.destroyed && !response.writableEnded) {
+          fail(response, error);
+        }
       },
     );
     inflight.add(pending);
     void pending.finally(() => {
       inflight.delete(pending);
-      log({
-        level: "info",
-        msg: "request",
-        method,
-        path: url.pathname,
-        status: response.statusCode,
-        ms: Date.now() - startedAt,
-      });
+      if (!forcedShutdown) {
+        log({
+          level: "info",
+          msg: "request",
+          method,
+          path: url.pathname,
+          status: response.statusCode,
+          ms: Date.now() - startedAt,
+        });
+      }
     });
   });
 
@@ -507,6 +515,15 @@ export async function createSunsetServer(
 
   let closing: Promise<void> | undefined;
 
+  async function drainLog(): Promise<void> {
+    for (;;) {
+      const tail = logTail;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await tail;
+      if (tail === logTail) return;
+    }
+  }
+
   return {
     port,
     token,
@@ -519,10 +536,24 @@ export async function createSunsetServer(
           );
           wss.close();
           await Promise.allSettled([...sockets].map(closeSocket));
-          await Promise.allSettled([...inflight]);
+          let drainTimer: ReturnType<typeof setTimeout> | undefined;
+          const drained = await Promise.race([
+            Promise.allSettled([...inflight]).then(() => true),
+            new Promise<boolean>((resolve) => {
+              drainTimer = setTimeout(
+                () => resolve(false),
+                SHUTDOWN_DRAIN_TIMEOUT_MS,
+              );
+            }),
+          ]);
+          if (drainTimer) clearTimeout(drainTimer);
+          if (!drained) {
+            // ponytail: one global drain deadline; per-request deadlines if shutdown latency needs finer control
+            forcedShutdown = true;
+            server.closeAllConnections();
+          }
           await httpClosed;
-          await new Promise<void>((resolve) => setImmediate(resolve));
-          await logTail;
+          await drainLog();
         })();
       }
       return closing;
