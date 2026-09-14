@@ -113,7 +113,7 @@ describe("createEngine over ACP", () => {
       model: { id: "default", params: [] },
     });
     const rejection = expect(creating).rejects.toThrow(
-      "engine_startup_timeout",
+      "acp_request_timeout:initialize",
     );
     await vi.advanceTimersByTimeAsync(30_000);
 
@@ -176,5 +176,149 @@ describe("createEngine over ACP", () => {
     release();
     await run.wait();
     await session.dispose();
+  });
+
+  it("closes the connection and rejects when session/new outlives the timeout", async () => {
+    process.env.SUNSET_ACP_TIMEOUT_MS = "50";
+    try {
+      let closes = 0;
+      const app = acpAgent({ name: "fake-acp" });
+      app.onRequest("initialize", () => ({
+        protocolVersion: 1,
+        agentCapabilities: {},
+        authMethods: [],
+      }));
+      app.onRequest("session/new", () => new Promise(() => {}));
+      const base = inProcessConnector(() => app);
+      const engine = createEngine(ENGINES.devin, {
+        connector: async (input) => {
+          const handle = await base(input);
+          return {
+            ...handle,
+            close: () => {
+              closes += 1;
+              handle.close();
+            },
+          };
+        },
+      });
+      await expect(
+        engine.create({ cwd: "/tmp", model: { id: "default", params: [] } }),
+      ).rejects.toThrow("acp_request_timeout:session/new");
+      expect(closes).toBe(1);
+    } finally {
+      delete process.env.SUNSET_ACP_TIMEOUT_MS;
+    }
+  });
+
+  it("rejects a session/resume timeout instead of falling back to session/load", async () => {
+    process.env.SUNSET_ACP_TIMEOUT_MS = "50";
+    try {
+      let loadCalls = 0;
+      const app = acpAgent({ name: "fake-acp" });
+      app.onRequest("initialize", () => ({
+        protocolVersion: 1,
+        agentCapabilities: { loadSession: true },
+        authMethods: [],
+      }));
+      app.onRequest("session/resume", () => new Promise(() => {}));
+      app.onRequest("session/load", () => {
+        loadCalls += 1;
+        return { sessionId: "s" };
+      });
+      const engine = createEngine(ENGINES.devin, {
+        connector: inProcessConnector(() => app),
+      });
+      await expect(
+        engine.resume({
+          cwd: "/tmp",
+          model: { id: "default", params: [] },
+          providerSessionId: "s",
+        }),
+      ).rejects.toThrow("acp_request_timeout:session/resume");
+      expect(loadCalls).toBe(0);
+    } finally {
+      delete process.env.SUNSET_ACP_TIMEOUT_MS;
+    }
+  });
+
+  it("uses the default 30s timeout when SUNSET_ACP_TIMEOUT_MS is invalid", async () => {
+    vi.useFakeTimers();
+    process.env.SUNSET_ACP_TIMEOUT_MS = "bogus";
+    try {
+      const app = acpAgent({ name: "fake-acp" });
+      app.onRequest("initialize", () => ({
+        protocolVersion: 1,
+        agentCapabilities: {},
+        authMethods: [],
+      }));
+      app.onRequest("session/new", () => new Promise(() => {}));
+      const engine = createEngine(ENGINES.devin, {
+        connector: inProcessConnector(() => app),
+      });
+      const pending = engine.create({
+        cwd: "/tmp",
+        model: { id: "default", params: [] },
+      });
+      const assertion = expect(pending).rejects.toThrow(
+        "acp_request_timeout:session/new",
+      );
+      await vi.advanceTimersByTimeAsync(60_000);
+      await assertion;
+    } finally {
+      delete process.env.SUNSET_ACP_TIMEOUT_MS;
+      vi.useRealTimers();
+    }
+  });
+
+  it("leaves session/prompt unbounded and emits a final usage event", async () => {
+    process.env.SUNSET_ACP_TIMEOUT_MS = "50";
+    try {
+      let promptResponse: unknown = {
+        stopReason: "end_turn",
+        _meta: { quota: { used: 3, size: 10 } },
+      };
+      const app = acpAgent({ name: "fake-acp" });
+      app.onRequest("initialize", () => ({
+        protocolVersion: 1,
+        agentCapabilities: {},
+        authMethods: [],
+      }));
+      app.onRequest("session/new", () => ({ sessionId: "s" }));
+      app.onRequest("session/prompt", async () => {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        return promptResponse;
+      });
+      app.onNotification("session/cancel", () => undefined);
+      const engine = createEngine(ENGINES.devin, {
+        connector: inProcessConnector(() => app),
+      });
+      const session = await engine.create({
+        cwd: "/tmp",
+        model: { id: "default", params: [] },
+      });
+
+      // The prompt outlives the 50ms control-plane timeout and still finishes.
+      const run = await session.send("hi");
+      const events: AgentEvent[] = [];
+      for await (const event of run.stream()) events.push(event);
+      expect((await run.wait()).status).toBe("finished");
+      expect(events.at(-1)).toEqual({ type: "usage", used: 3, size: 10 });
+
+      // An SDK-typed usage payload without numeric used/size emits nothing.
+      promptResponse = {
+        stopReason: "end_turn",
+        usage: { totalTokens: 9, inputTokens: 5, outputTokens: 4 },
+      };
+      const second = await session.send("again");
+      const secondEvents: AgentEvent[] = [];
+      for await (const event of second.stream()) secondEvents.push(event);
+      expect((await second.wait()).status).toBe("finished");
+      expect(secondEvents.some((event) => event.type === "usage")).toBe(false);
+
+      await session.dispose();
+    } finally {
+      delete process.env.SUNSET_ACP_TIMEOUT_MS;
+    }
   });
 });

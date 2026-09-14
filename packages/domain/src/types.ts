@@ -78,6 +78,12 @@ export type AgentEvent =
     }
   | { type: "mode"; modeId: string }
   | { type: "status"; status: string; message?: string }
+  | { type: "usage"; used: number; size: number }
+  | { type: "session_title"; title: string }
+  | {
+      type: "commands";
+      commands: Array<{ name: string; description?: string }>;
+    }
   | { type: "error"; message: string };
 
 export type Project = { id: string; repoRoot: string };

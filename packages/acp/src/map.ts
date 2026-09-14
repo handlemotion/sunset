@@ -81,9 +81,27 @@ export function mapSessionUpdate(update: acp.SessionUpdate): AgentEvent[] {
     case "current_mode_update":
       return [{ type: "mode", modeId: update.currentModeId }];
     case "available_commands_update":
-    case "config_option_update":
-    case "session_info_update":
+      return [
+        {
+          type: "commands",
+          commands: update.availableCommands.map((command) => ({
+            name: command.name,
+            ...(typeof command.description === "string"
+              ? { description: command.description }
+              : {}),
+          })),
+        },
+      ];
+    case "session_info_update": {
+      const title =
+        typeof update.title === "string" ? update.title : update._meta?.title;
+      return typeof title === "string"
+        ? [{ type: "session_title", title }]
+        : [];
+    }
     case "usage_update":
+      return [{ type: "usage", used: update.used, size: update.size }];
+    case "config_option_update":
     case "compaction_update":
     case "compaction_summary_chunk":
     case "plan_update":
@@ -156,6 +174,30 @@ export function asAgentEvent(value: unknown): AgentEvent | null {
               : {}),
           }
         : null;
+    case "usage":
+      return typeof record.used === "number" && typeof record.size === "number"
+        ? { type: "usage", used: record.used, size: record.size }
+        : null;
+    case "session_title":
+      return typeof record.title === "string"
+        ? { type: "session_title", title: record.title }
+        : null;
+    case "commands": {
+      if (!Array.isArray(record.commands)) return null;
+      const commands: Array<{ name: string; description?: string }> = [];
+      for (const entry of record.commands as Array<unknown>) {
+        if (typeof entry !== "object" || entry === null) return null;
+        const { name, description } = entry as Record<string, unknown>;
+        if (typeof name !== "string") return null;
+        if (description !== undefined && typeof description !== "string") {
+          return null;
+        }
+        commands.push(
+          typeof description === "string" ? { name, description } : { name },
+        );
+      }
+      return { type: "commands", commands };
+    }
     case "error":
       return typeof record.message === "string"
         ? { type: "error", message: record.message }
