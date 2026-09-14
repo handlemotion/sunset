@@ -74,7 +74,7 @@ export type FakeAcpAgentOptions = {
   prompt?: FakeAcpPrompt;
   /** These methods accept the request but never answer it. */
   hangOn?: string[];
-  /** These methods are left unregistered; the SDK answers method-not-found. */
+  /** Requests for these methods return JSON-RPC method-not-found errors. */
   methodNotFound?: string[];
   /**
    * Disconnect the agent mid-conversation. A method name closes the
@@ -139,9 +139,6 @@ export function fakeAcpAgent(options: FakeAcpAgentOptions = {}): FakeAcpAgent {
     connections: 0,
   };
 
-  const skipped = (method: string): boolean =>
-    options.methodNotFound?.includes(method) ?? false;
-
   function build(): AgentApp {
     const app = acpAgent({ name: options.name ?? "fake-acp" });
     const conn = {
@@ -149,6 +146,7 @@ export function fakeAcpAgent(options: FakeAcpAgentOptions = {}): FakeAcpAgent {
       authenticated: false,
       authenticateCalls: 0,
       exited: false,
+      activePrompts: new Set<string>(),
       cancelled: new Set<string>(),
       cancelWaiters: new Map<string, Array<() => void>>(),
     };
@@ -159,6 +157,12 @@ export function fakeAcpAgent(options: FakeAcpAgentOptions = {}): FakeAcpAgent {
 
     const record = (method: string, params: unknown): void => {
       calls.push({ method, params });
+    };
+    const receive = (method: string, params: unknown): void => {
+      record(method, params);
+      if (options.methodNotFound?.includes(method)) {
+        throw RequestError.methodNotFound(method);
+      }
     };
     // Answer only when the connection drops, so hung requests release cleanly
     // instead of leaving a pending promise behind after a test.
@@ -200,107 +204,94 @@ export function fakeAcpAgent(options: FakeAcpAgentOptions = {}): FakeAcpAgent {
         signal.addEventListener("abort", () => resolve(), { once: true });
       });
 
-    if (!skipped("initialize")) {
-      app.onRequest("initialize", (ctx) => {
-        record("initialize", ctx.params);
-        if (hanging("initialize")) return hang(ctx.signal);
-        maybeExit("initialize");
-        return {
-          protocolVersion: options.protocolVersion ?? 1,
-          agentCapabilities: options.agentCapabilities ?? {},
-          authMethods: options.authMethods ?? [],
-        };
-      });
-    }
+    app.onRequest("initialize", (ctx) => {
+      receive("initialize", ctx.params);
+      if (hanging("initialize")) return hang(ctx.signal);
+      maybeExit("initialize");
+      return {
+        protocolVersion: options.protocolVersion ?? 1,
+        agentCapabilities: options.agentCapabilities ?? {},
+        authMethods: options.authMethods ?? [],
+      };
+    });
 
-    if (!skipped("authenticate")) {
-      app.onRequest("authenticate", (ctx) => {
-        record("authenticate", ctx.params);
-        if (hanging("authenticate")) return hang(ctx.signal);
-        conn.authenticateCalls += 1;
-        const required = options.authenticate?.methodId;
-        if (required && ctx.params.methodId !== required) {
-          throw RequestError.invalidParams(
-            ctx.params,
-            `unknown auth method: ${ctx.params.methodId}`,
-          );
-        }
-        if (conn.authenticateCalls <= (options.authenticate?.failTimes ?? 0)) {
-          const failure = options.authenticate?.error;
-          throw failure ? asRpcError(failure) : authError();
-        }
-        conn.authenticated = true;
-        maybeExit("authenticate");
-        return {};
-      });
-    }
+    app.onRequest("authenticate", (ctx) => {
+      receive("authenticate", ctx.params);
+      if (hanging("authenticate")) return hang(ctx.signal);
+      conn.authenticateCalls += 1;
+      const required = options.authenticate?.methodId;
+      if (required && ctx.params.methodId !== required) {
+        throw RequestError.invalidParams(
+          ctx.params,
+          `unknown auth method: ${ctx.params.methodId}`,
+        );
+      }
+      if (conn.authenticateCalls <= (options.authenticate?.failTimes ?? 0)) {
+        const failure = options.authenticate?.error;
+        throw failure ? asRpcError(failure) : authError();
+      }
+      conn.authenticated = true;
+      maybeExit("authenticate");
+      return {};
+    });
 
-    if (!skipped("session/new")) {
-      app.onRequest("session/new", (ctx) => {
-        record("session/new", ctx.params);
-        if (hanging("session/new")) return hang(ctx.signal);
-        requireAuth();
-        maybeExit("session/new");
-        return {
-          sessionId: options.sessionId ?? "fake-session-1",
-          ...(options.modes !== undefined ? { modes: options.modes } : {}),
-          ...(options.models ? { models: options.models } : {}),
-        } as NewSessionResponse;
-      });
-    }
+    app.onRequest("session/new", (ctx) => {
+      receive("session/new", ctx.params);
+      if (hanging("session/new")) return hang(ctx.signal);
+      requireAuth();
+      maybeExit("session/new");
+      return {
+        sessionId: options.sessionId ?? "fake-session-1",
+        ...(options.modes !== undefined ? { modes: options.modes } : {}),
+        ...(options.models ? { models: options.models } : {}),
+      } as NewSessionResponse;
+    });
 
-    if (!skipped("session/resume")) {
-      app.onRequest("session/resume", (ctx) => {
-        record("session/resume", ctx.params);
-        if (hanging("session/resume")) return hang(ctx.signal);
-        requireAuth();
-        failIf(options.resume);
-        maybeExit("session/resume");
-        return {};
-      });
-    }
+    app.onRequest("session/resume", (ctx) => {
+      receive("session/resume", ctx.params);
+      if (hanging("session/resume")) return hang(ctx.signal);
+      requireAuth();
+      failIf(options.resume);
+      maybeExit("session/resume");
+      return {};
+    });
 
-    if (!skipped("session/load")) {
-      app.onRequest("session/load", (ctx) => {
-        record("session/load", ctx.params);
-        if (hanging("session/load")) return hang(ctx.signal);
-        requireAuth();
-        failIf(options.load);
-        maybeExit("session/load");
-        return {};
-      });
-    }
+    app.onRequest("session/load", (ctx) => {
+      receive("session/load", ctx.params);
+      if (hanging("session/load")) return hang(ctx.signal);
+      requireAuth();
+      failIf(options.load);
+      maybeExit("session/load");
+      return {};
+    });
 
-    if (!skipped("session/set_mode")) {
-      app.onRequest("session/set_mode", (ctx) => {
-        record("session/set_mode", ctx.params);
-        if (hanging("session/set_mode")) return hang(ctx.signal);
-        maybeExit("session/set_mode");
-        return {};
-      });
-    }
+    app.onRequest("session/set_mode", (ctx) => {
+      receive("session/set_mode", ctx.params);
+      if (hanging("session/set_mode")) return hang(ctx.signal);
+      maybeExit("session/set_mode");
+      return {};
+    });
 
     // Not a schema method in this SDK version; register with a passthrough
     // params parser so the codex-style set_model flow can be exercised.
-    if (!skipped("session/set_model")) {
-      app.onRequest(
-        "session/set_model",
-        (params) => params as { sessionId: string; modelId: string },
-        (ctx) => {
-          record("session/set_model", ctx.params);
-          if (hanging("session/set_model")) return hang(ctx.signal);
-          maybeExit("session/set_model");
-          return {};
-        },
-      );
-    }
+    app.onRequest(
+      "session/set_model",
+      (params) => params as { sessionId: string; modelId: string },
+      (ctx) => {
+        receive("session/set_model", ctx.params);
+        if (hanging("session/set_model")) return hang(ctx.signal);
+        maybeExit("session/set_model");
+        return {};
+      },
+    );
 
-    if (!skipped("session/prompt")) {
-      app.onRequest("session/prompt", async (ctx) => {
-        record("session/prompt", ctx.params);
-        if (hanging("session/prompt")) return hang(ctx.signal);
-        requireAuth();
-        const { sessionId } = ctx.params;
+    app.onRequest("session/prompt", async (ctx) => {
+      receive("session/prompt", ctx.params);
+      if (hanging("session/prompt")) return hang(ctx.signal);
+      requireAuth();
+      const { sessionId } = ctx.params;
+      conn.activePrompts.add(sessionId);
+      try {
         const script: SessionUpdate[] = options.prompt?.updates ?? [
           {
             sessionUpdate: "agent_message_chunk",
@@ -308,7 +299,7 @@ export function fakeAcpAgent(options: FakeAcpAgentOptions = {}): FakeAcpAgent {
           },
         ];
         for (const [index, update] of script.entries()) {
-          if (conn.cancelled.has(sessionId)) {
+          if (conn.cancelled.delete(sessionId)) {
             return { stopReason: "cancelled" };
           }
           await ctx.client.notify("session/update", { sessionId, update });
@@ -328,20 +319,23 @@ export function fakeAcpAgent(options: FakeAcpAgentOptions = {}): FakeAcpAgent {
         if (options.prompt?.error) throw asRpcError(options.prompt.error);
         maybeExit("session/prompt");
         return { stopReason: options.prompt?.stopReason ?? "end_turn" };
-      });
-    }
+      } finally {
+        conn.activePrompts.delete(sessionId);
+        conn.cancelled.delete(sessionId);
+        conn.cancelWaiters.delete(sessionId);
+      }
+    });
 
-    if (!skipped("session/cancel")) {
-      app.onNotification("session/cancel", (ctx) => {
-        record("session/cancel", ctx.params);
-        conn.cancelled.add(ctx.params.sessionId);
-        for (const wake of conn.cancelWaiters.get(ctx.params.sessionId) ?? []) {
-          wake();
-        }
-        conn.cancelWaiters.delete(ctx.params.sessionId);
-        maybeExit("session/cancel");
-      });
-    }
+    app.onNotification("session/cancel", (ctx) => {
+      record("session/cancel", ctx.params);
+      if (!conn.activePrompts.has(ctx.params.sessionId)) return;
+      conn.cancelled.add(ctx.params.sessionId);
+      for (const wake of conn.cancelWaiters.get(ctx.params.sessionId) ?? []) {
+        wake();
+      }
+      conn.cancelWaiters.delete(ctx.params.sessionId);
+      maybeExit("session/cancel");
+    });
 
     return app;
   }
@@ -362,7 +356,7 @@ export function inProcessConnector(build: () => AgentApp): FakeAcpConnector {
     const conn = app.connect(build());
     conn.closed.then(
       () => onClose(null),
-      () => onClose(null),
+      (error) => onClose(error),
     );
     return {
       request: conn.agent.request.bind(conn.agent),

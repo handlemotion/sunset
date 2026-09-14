@@ -162,6 +162,7 @@ describe("fakeAcpAgent over createEngine", () => {
     expect(session.providerSessionId).toBe("sess-old");
     expect(fake.calls.map((call) => call.method)).toEqual([
       "initialize",
+      "session/resume",
       "session/load",
     ]);
     expect(fake.calls[1]?.params).toMatchObject({ sessionId: "sess-old" });
@@ -241,6 +242,39 @@ describe("fakeAcpAgent over createEngine", () => {
     const result = await run.wait();
     expect(result.status).toBe("error");
     expect(result.error?.message).toContain("boom");
+    await session.dispose();
+  });
+
+  it("does not carry cancellation into the next prompt", async () => {
+    const fake = fakeAcpAgent({
+      prompt: {
+        waitForCancel: true,
+        updates: [
+          {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "partial" },
+          },
+        ],
+      },
+    });
+    const engine = createEngine(ENGINES.devin, { connector: fake.connector });
+    const session = await engine.create(createInput);
+
+    const first = await session.send("first");
+    await first.cancel();
+    expect((await first.wait()).status).toBe("cancelled");
+
+    const second = await session.send("second");
+    const events: AgentEvent[] = [];
+    const streaming = (async () => {
+      for await (const event of second.stream()) events.push(event);
+    })();
+    await sleep(0);
+    await second.cancel();
+    expect((await second.wait()).status).toBe("cancelled");
+    await streaming;
+
+    expect(events).toEqual([{ type: "text_delta", text: "partial" }]);
     await session.dispose();
   });
 
