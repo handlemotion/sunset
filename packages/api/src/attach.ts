@@ -150,12 +150,13 @@ export function attachRunEvents(
           fail(new Error("attachRun: received a malformed JSON frame"));
           return;
         }
-        // A bare {type:"error"} frame is the server's terminal stream error;
-        // a sequenced error is an ordinary HostEvent and is yielded.
+        // A bare {type:"error"} frame (no sequence) is the server's terminal
+        // stream error; a sequenced error is an ordinary HostEvent. A present
+        // but invalid sequence falls through to envelope validation.
         if (
           isRecord(parsed) &&
           parsed.type === "error" &&
-          !Number.isSafeInteger(parsed.sequence)
+          parsed.sequence === undefined
         ) {
           fail(
             new RunStreamError(
@@ -302,11 +303,10 @@ export function attachRunEvents(
         connect();
       }
 
-      start();
-
       const iterator: AsyncIterableIterator<HostEvent> = {
         next() {
           if (cancelled) return Promise.resolve(DONE);
+          start();
           if (queue.length > 0) {
             return Promise.resolve({ value: queue.shift()!, done: false });
           }

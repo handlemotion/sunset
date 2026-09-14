@@ -219,12 +219,13 @@ describe("attachRun", () => {
       .attachRun("r1", { reconnectDelayMs: 1 })
       [Symbol.asyncIterator]();
 
+    const pending = iterator.next();
     const ws1 = FakeWebSocket.instances[0]!;
     expect(new URL(ws1.url).searchParams.get("after")).toBe("0");
 
     ws1.message(ev(1));
     ws1.message(ev(2));
-    expect((await iterator.next()).value).toMatchObject({ sequence: 1 });
+    expect((await pending).value).toMatchObject({ sequence: 1 });
 
     // ev(2) is still buffered when the server closes on a finished run.
     ws1.serverClose();
@@ -241,8 +242,9 @@ describe("attachRun", () => {
     const iterator = client
       .attachRun("r1", { reconnectDelayMs: 1 })
       [Symbol.asyncIterator]();
+    const pending = iterator.next();
     FakeWebSocket.instances[0]!.serverClose();
-    expect((await iterator.next()).done).toBe(true);
+    expect((await pending).done).toBe(true);
   });
 
   it("throws RunStreamError on a bare error frame", async () => {
@@ -327,13 +329,37 @@ describe("attachRun", () => {
         sessionId: "s1",
         runId: "r1",
       },
+      {
+        type: "error", // present but non-numeric sequence
+        message: "x",
+        sequence: "4",
+        workspaceId: "w1",
+        sessionId: "s1",
+        runId: "r1",
+      },
+      {
+        type: "error", // present but fractional sequence
+        message: "x",
+        sequence: 1.5,
+        workspaceId: "w1",
+        sessionId: "s1",
+        runId: "r1",
+      },
+      {
+        type: "error", // present but null sequence
+        message: "x",
+        sequence: null,
+        workspaceId: "w1",
+        sessionId: "s1",
+        runId: "r1",
+      },
     ];
     for (const frame of badFrames) {
       const iter = client
         .attachRun("r1", { reconnectDelayMs: 1 })
         [Symbol.asyncIterator]();
-      const ws = FakeWebSocket.instances.at(-1)!;
       const pending = iter.next();
+      const ws = FakeWebSocket.instances.at(-1)!;
       ws.message(frame);
       await expect(pending).rejects.toThrow(/malformed event/);
     }
@@ -364,8 +390,8 @@ describe("attachRun", () => {
       .attachRun("r1", { signal: controller.signal, reconnectDelayMs: 20 })
       [Symbol.asyncIterator]();
 
-    const ws1 = FakeWebSocket.instances[0]!;
     const pending = iterator.next();
+    const ws1 = FakeWebSocket.instances[0]!;
     ws1.drop();
     controller.abort();
 
@@ -385,8 +411,8 @@ describe("attachRun", () => {
       .attachRun("r1", { signal: controller.signal, reconnectDelayMs: 1 })
       [Symbol.asyncIterator]();
 
-    const ws = FakeWebSocket.instances[0]!;
     const pending = iterator.next();
+    const ws = FakeWebSocket.instances[0]!;
     ws.message(ev(1));
     expect((await pending).value).toMatchObject({ sequence: 1 });
     ws.message(ev(2)); // buffered, undelivered
@@ -395,6 +421,27 @@ describe("attachRun", () => {
     expect((await iterator.next()).done).toBe(true);
     expect(ws.closed).toBe(true);
     expect(ws.listenerCount("message")).toBe(0);
+  });
+
+  it("opens no socket until the first next(), so return/throw beforehand leak nothing", async () => {
+    stubRunStatus(() => "running");
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+
+    const client = createClient({ baseUrl: BASE, token: TOKEN });
+    const abandoned = client
+      .attachRun("r1", { reconnectDelayMs: 1 })
+      [Symbol.asyncIterator]();
+    expect(FakeWebSocket.instances).toHaveLength(0);
+
+    await abandoned.return(undefined);
+    expect(FakeWebSocket.instances).toHaveLength(0);
+    expect((await abandoned.next()).done).toBe(true);
+
+    const thrown = client
+      .attachRun("r1", { reconnectDelayMs: 1 })
+      [Symbol.asyncIterator]();
+    await expect(thrown.throw(new Error("halt"))).rejects.toThrow("halt");
+    expect(FakeWebSocket.instances).toHaveLength(0);
   });
 
   it("return() resolves a pending next, discards the queue, and clears a latched failure", async () => {
@@ -406,21 +453,24 @@ describe("attachRun", () => {
       .attachRun("r1", { reconnectDelayMs: 1 })
       [Symbol.asyncIterator]();
 
+    // A pending next() resolves done on return.
+    const pending = iterator.next();
     const ws = FakeWebSocket.instances[0]!;
-    // A stream error with no pending next() latches the failure.
-    ws.message({ type: "error", message: "boom" });
     await iterator.return(undefined);
-    expect((await iterator.next()).done).toBe(true);
+    expect((await pending).done).toBe(true);
     expect(ws.closed).toBe(true);
     expect(ws.listenerCount("message")).toBe(0);
 
-    // Buffered events are also discarded.
+    // A failure latched before return is cleared, not thrown.
     const iterator2 = client
       .attachRun("r1", { reconnectDelayMs: 1 })
       [Symbol.asyncIterator]();
+    const first2 = iterator2.next();
     const ws2 = FakeWebSocket.instances[1]!;
     ws2.message(ev(1));
-    ws2.message(ev(2));
+    expect((await first2).value).toMatchObject({ sequence: 1 });
+    ws2.message(ev(2)); // buffered, discarded by return
+    ws2.message({ type: "error", message: "boom" }); // latched, no waiter
     await iterator2.return(undefined);
     expect((await iterator2.next()).done).toBe(true);
     expect(ws2.closed).toBe(true);
