@@ -119,6 +119,9 @@ importers:
 
   packages/cli:
     dependencies:
+      "@sunset/acp":
+        specifier: workspace:*
+        version: link:../acp
       "@sunset/domain":
         specifier: workspace:*
         version: link:../domain

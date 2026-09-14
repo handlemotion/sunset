@@ -1,33 +1,53 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { homedir } from "node:os";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { createHost } from "@sunset/host";
 import { createSunsetServer } from "@sunset/server";
 
-const DEFAULT_STATE_ROOT = path.join(
-  process.env.SUNSET_STATE_DIR ??
-    path.join(homedir(), ".local", "share", "sunset"),
-);
+import { loadConfig, resolveConfig, type ResolvedConfig } from "./config.js";
+import { runDoctor } from "./doctor.js";
+import { withSessionDefaults } from "./session-defaults.js";
 
-function usage(): never {
-  console.error(`sunset — browser development workspace
+const HELP = `sunset — browser development workspace
 
 Usage:
-  sunset serve [--port N] [--state-dir DIR] [--web-dist DIR]
-  sunset open  [--port N] [--state-dir DIR] [--web-dist DIR]
+  sunset serve [--port N] [--state-dir DIR] [--worktree-root DIR]
+               [--web-dist DIR] [--engine devin|codex] [--model ID]
+  sunset open  [same flags as serve] — serve, then open a browser
+  sunset doctor [--state-dir DIR]
   sunset projects add <repo-root> [--state-dir DIR]
   sunset projects list [--state-dir DIR]
   sunset workspaces create <project-id> <slug> [--state-dir DIR]
   sunset workspaces list <project-id> [--state-dir DIR]
   sunset capabilities [--state-dir DIR]
+  sunset help | --help
+  sunset --version
+
+Config file:
+  ~/.config/sunset/config.json (override with SUNSET_CONFIG)
+  Supported keys: port (number), stateDir (string),
+  defaultEngine ("devin" | "codex"), defaultModel (string).
+  Precedence: config file < environment < CLI flags.
 
 Environment:
-  SUNSET_STATE_DIR   default state root (default ~/.local/share/sunset)
-  SUNSET_WEB_DIST    web build directory (default bundled apps/web/dist)
-`);
+  SUNSET_CONFIG          config file path
+  SUNSET_STATE_DIR       state root (state dir is $SUNSET_STATE_DIR/state)
+                         (default ~/.local/share/sunset)
+  SUNSET_PORT            default port for serve/open
+  SUNSET_DEFAULT_ENGINE  default engine: devin or codex
+  SUNSET_DEFAULT_MODEL   default model id
+  SUNSET_WEB_DIST        web build directory (default bundled apps/web/dist)
+`;
+
+function printHelp(): void {
+  console.log(HELP);
+}
+
+function usage(): never {
+  console.error(HELP);
   process.exit(2);
 }
 
@@ -55,14 +75,19 @@ function positional(args: string[]): string[] {
   return out;
 }
 
-function stateDir(args: string[]): string {
-  return flag(args, "state-dir") ?? path.join(DEFAULT_STATE_ROOT, "state");
-}
+let versionPromise: Promise<string> | undefined;
 
-function worktreeRoot(args: string[]): string {
-  return (
-    flag(args, "worktree-root") ?? path.join(DEFAULT_STATE_ROOT, "worktrees")
-  );
+function cliVersion(): Promise<string> {
+  versionPromise ??= (async () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const text = await readFile(
+      path.resolve(here, "..", "package.json"),
+      "utf8",
+    );
+    const pkg = JSON.parse(text) as { version?: unknown };
+    return typeof pkg.version === "string" ? pkg.version : "0.0.0";
+  })();
+  return versionPromise;
 }
 
 function webDist(args: string[]): string | undefined {
@@ -87,21 +112,27 @@ async function openBrowser(url: string): Promise<void> {
   child.unref();
 }
 
-async function serve(args: string[], open: boolean): Promise<void> {
-  const host = await createHost({
-    stateDir: stateDir(args),
-    worktreeRoot: worktreeRoot(args),
-  });
-  const port = flag(args, "port");
+async function serve(
+  config: ResolvedConfig,
+  args: string[],
+  open: boolean,
+): Promise<void> {
+  const host = withSessionDefaults(
+    await createHost({
+      stateDir: config.stateDir,
+      worktreeRoot: config.worktreeRoot,
+    }),
+    config,
+  );
   const server = await createSunsetServer({
     host,
     webDist: webDist(args),
-    ...(port ? { port: Number(port) } : {}),
+    ...(config.port !== undefined ? { port: config.port } : {}),
   });
   const url = `${server.url}/?token=${server.token}`;
   console.log(`sunset is running`);
   console.log(`  url:   ${url}`);
-  console.log(`  state: ${stateDir(args)}`);
+  console.log(`  state: ${config.stateDir}`);
   if (open) await openBrowser(url);
 
   const shutdown = () => {
@@ -116,19 +147,44 @@ async function serve(args: string[], open: boolean): Promise<void> {
 
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
+
+  if (command === "help" || command === "--help" || command === "-h") {
+    printHelp();
+    return;
+  }
+  if (command === "--version" || command === "version") {
+    console.log(await cliVersion());
+    return;
+  }
   if (!command) usage();
 
-  if (command === "serve") return serve(rest, false);
-  if (command === "open") return serve(rest, true);
+  const loaded = await loadConfig();
+  const resolved = resolveConfig(loaded, process.env, {
+    port: flag(rest, "port"),
+    stateDir: flag(rest, "state-dir"),
+    worktreeRoot: flag(rest, "worktree-root"),
+    engine: flag(rest, "engine"),
+    model: flag(rest, "model"),
+  });
+  if (resolved.errors.length > 0) {
+    for (const error of resolved.errors) console.error(error);
+    usage();
+  }
+
+  if (command === "doctor") {
+    process.exit(await runDoctor(resolved, await cliVersion()));
+  }
+  for (const warning of resolved.warnings) {
+    console.error(`warning: ${warning}`);
+  }
+  if (command === "serve") return serve(resolved, rest, false);
+  if (command === "open") return serve(resolved, rest, true);
 
   const host = await createHost({
-    stateDir: stateDir(rest),
-    worktreeRoot: worktreeRoot(rest),
+    stateDir: resolved.stateDir,
+    worktreeRoot: resolved.worktreeRoot,
   });
   try {
-    const [sub, ...tail] = rest.filter((arg) => !arg.startsWith("--"));
-    void sub;
-    void tail;
     const args = positional(rest);
     switch (command) {
       case "projects": {
@@ -164,4 +220,7 @@ async function main(): Promise<void> {
   }
 }
 
-await main();
+main().catch((error: unknown) => {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exit(1);
+});
