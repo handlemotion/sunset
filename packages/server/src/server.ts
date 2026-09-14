@@ -5,7 +5,7 @@ import {
   type ServerResponse,
 } from "node:http";
 import { randomBytes } from "node:crypto";
-import { readFile, stat } from "node:fs/promises";
+import { appendFile, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 
 import { WebSocketServer, type WebSocket } from "ws";
@@ -22,6 +22,35 @@ const MIME: Record<string, string> = {
   ".ico": "image/x-icon",
   ".woff2": "font/woff2",
   ".map": "application/json",
+};
+
+const MAX_BODY_BYTES = 1024 * 1024;
+const SHUTDOWN_DRAIN_TIMEOUT_MS = 1000;
+
+const ALLOWED_ORIGIN_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+class PayloadTooLargeError extends Error {
+  constructor() {
+    super("request body exceeds 1 MiB");
+    this.name = "PayloadTooLargeError";
+  }
+}
+
+class InvalidRequestTargetError extends Error {
+  constructor() {
+    super("invalid request target");
+    this.name = "InvalidRequestTargetError";
+  }
+}
+
+type LogEntry = {
+  level: "info" | "error";
+  msg: string;
+  method?: string;
+  path?: string;
+  status?: number;
+  ms?: number;
+  err?: string;
 };
 
 export type SunsetServerOptions = {
@@ -47,6 +76,20 @@ function json(response: ServerResponse, status: number, value: unknown): void {
 }
 
 function fail(response: ServerResponse, error: unknown): void {
+  if (error instanceof PayloadTooLargeError) {
+    response.shouldKeepAlive = false;
+    response.setHeader("connection", "close");
+    json(response, 413, {
+      error: { code: "payload_too_large", message: error.message },
+    });
+    return;
+  }
+  if (error instanceof InvalidRequestTargetError) {
+    json(response, 400, {
+      error: { code: "invalid_request_target", message: error.message },
+    });
+    return;
+  }
   if (isSunsetBoundaryError(error)) {
     json(response, 400, {
       error: { code: error.code, message: error.message },
@@ -63,7 +106,13 @@ function fail(response: ServerResponse, error: unknown): void {
 
 async function body(request: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
-  for await (const chunk of request) chunks.push(chunk as Buffer);
+  let size = 0;
+  for await (const chunk of request.iterator({ destroyOnReturn: false })) {
+    const buffer = chunk as Buffer;
+    size += buffer.length;
+    if (size > MAX_BODY_BYTES) throw new PayloadTooLargeError();
+    chunks.push(buffer);
+  }
   if (chunks.length === 0) return {};
   const text = Buffer.concat(chunks).toString("utf8");
   if (!text) return {};
@@ -82,6 +131,51 @@ function fields(value: unknown): Record<string, unknown> {
 
 function stringField(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function originAllowed(request: IncomingMessage): boolean {
+  const origin = request.headers.origin;
+  if (origin === undefined) return true;
+  try {
+    return ALLOWED_ORIGIN_HOSTNAMES.has(new URL(origin).hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+function requestPath(request: IncomingMessage): string {
+  try {
+    return new URL(request.url ?? "/", "http://127.0.0.1").pathname;
+  } catch {
+    return "/";
+  }
+}
+
+function requestURL(request: IncomingMessage): URL {
+  try {
+    return new URL(request.url ?? "/", "http://127.0.0.1");
+  } catch {
+    throw new InvalidRequestTargetError();
+  }
+}
+
+function closeSocket(ws: WebSocket): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (ws.readyState === ws.CLOSED) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(() => ws.terminate(), 1000);
+    ws.once("close", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    ws.close();
+  });
 }
 
 async function serveStatic(
@@ -125,17 +219,66 @@ export async function createSunsetServer(
     return url.searchParams.get("token") === token;
   }
 
+  const logPath = process.env.SUNSET_LOG;
+  let logTail: Promise<void> = Promise.resolve();
+  let logFailureReported = false;
+  function log(entry: LogEntry): void {
+    if (!logPath) return;
+    const serialized = JSON.stringify({
+      ts: new Date().toISOString(),
+      ...entry,
+    });
+    const line = `${token ? serialized.split(token).join("[redacted]") : serialized}\n`;
+    logTail = logTail
+      .then(() => appendFile(logPath, line))
+      .catch(() => {
+        if (logFailureReported) return;
+        logFailureReported = true;
+        process.stderr.write("sunset server log write failed\n");
+      });
+  }
+
+  const inflight = new Set<Promise<void>>();
+  let forcedShutdown = false;
   const server: Server = createHttpServer((request, response) => {
-    void handleRequest(request, response).catch((error: unknown) =>
-      fail(response, error),
-    );
+    const startedAt = Date.now();
+    const method = request.method ?? "GET";
+    const pathname = requestPath(request);
+    const pending = handleRequest(request, response).catch((error: unknown) => {
+      if (!forcedShutdown && !(error instanceof PayloadTooLargeError)) {
+        log({
+          level: "error",
+          msg: "handler_error",
+          method,
+          path: pathname,
+          err: errorMessage(error),
+        });
+      }
+      if (!response.destroyed && !response.writableEnded) {
+        fail(response, error);
+      }
+    });
+    inflight.add(pending);
+    void pending.finally(() => {
+      inflight.delete(pending);
+      if (!forcedShutdown) {
+        log({
+          level: "info",
+          msg: "request",
+          method,
+          path: pathname,
+          status: response.statusCode,
+          ms: Date.now() - startedAt,
+        });
+      }
+    });
   });
 
   async function handleRequest(
     request: IncomingMessage,
     response: ServerResponse,
   ): Promise<void> {
-    const url = new URL(request.url ?? "/", `http://127.0.0.1`);
+    const url = requestURL(request);
     const pathname = url.pathname;
     const method = request.method ?? "GET";
 
@@ -148,11 +291,7 @@ export async function createSunsetServer(
       }
       const input = method === "POST" ? fields(await body(request)) : {};
       const parts = pathname.split("/").filter(Boolean).slice(1);
-      try {
-        await route(method, parts, input, response);
-      } catch (error) {
-        fail(response, error);
-      }
+      await route(method, parts, input, response);
       return;
     }
 
@@ -338,6 +477,11 @@ export async function createSunsetServer(
       socket.destroy();
       return;
     }
+    if (!originAllowed(request)) {
+      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+      socket.destroy();
+      return;
+    }
     const match = /^\/api\/runs\/([^/]+)\/events$/.exec(url.pathname);
     if (!match) {
       socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
@@ -346,7 +490,17 @@ export async function createSunsetServer(
     }
     wss.handleUpgrade(request, socket, head, (ws) => {
       sockets.add(ws);
-      ws.on("close", () => sockets.delete(ws));
+      const connectedAt = Date.now();
+      log({ level: "info", msg: "ws_connect", path: url.pathname });
+      ws.on("close", () => {
+        sockets.delete(ws);
+        log({
+          level: "info",
+          msg: "ws_disconnect",
+          path: url.pathname,
+          ms: Date.now() - connectedAt,
+        });
+      });
       const runId = match[1]!;
       const after = Number(url.searchParams.get("after") ?? "0");
       const controller = new AbortController();
@@ -363,6 +517,12 @@ export async function createSunsetServer(
             ws.send(JSON.stringify(event));
           }
         } catch (error) {
+          log({
+            level: "error",
+            msg: "ws_error",
+            path: url.pathname,
+            err: errorMessage(error),
+          });
           if (ws.readyState === ws.OPEN) {
             ws.send(
               JSON.stringify({
@@ -387,14 +547,51 @@ export async function createSunsetServer(
   const port =
     typeof address === "object" && address !== null ? address.port : 0;
 
+  let closing: Promise<void> | undefined;
+
+  async function drainLog(): Promise<void> {
+    for (;;) {
+      const tail = logTail;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await tail;
+      if (tail === logTail) return;
+    }
+  }
+
   return {
     port,
     token,
     url: `http://127.0.0.1:${port}`,
-    async close() {
-      for (const socket of sockets) socket.close();
-      wss.close();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+    close() {
+      if (!closing) {
+        closing = (async () => {
+          const httpClosed = new Promise<void>((resolve) =>
+            server.close(() => resolve()),
+          );
+          wss.close();
+          await Promise.allSettled([...sockets].map(closeSocket));
+          let drainTimer: ReturnType<typeof setTimeout> | undefined;
+          const drained = await Promise.race([
+            Promise.allSettled([...inflight]).then(() => true),
+            new Promise<boolean>((resolve) => {
+              drainTimer = setTimeout(
+                () => resolve(false),
+                SHUTDOWN_DRAIN_TIMEOUT_MS,
+              );
+            }),
+          ]);
+          if (drainTimer) clearTimeout(drainTimer);
+          if (!drained) {
+            // ponytail: one global drain deadline; per-request deadlines if shutdown latency needs finer control
+            forcedShutdown = true;
+            server.closeAllConnections();
+            inflight.clear();
+          }
+          await httpClosed;
+          await drainLog();
+        })();
+      }
+      return closing;
     },
   };
 }
