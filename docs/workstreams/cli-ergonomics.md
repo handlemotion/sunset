@@ -15,7 +15,7 @@ dependencies; do not modify their sources.
    - catalog fetch (`listModels("devin")`, `listModels("codex")`) with model
      count and default model, or the error
    - state dir writability, version info
-   Exit 0 when both engines resolve, 1 otherwise.
+     Exit 0 when both engines resolve, 1 otherwise.
 
 2. **Config file.** `~/.config/sunset/config.json` (override via
    `SUNSET_CONFIG`): `{ "port"?: number, "stateDir"?: string, "defaultEngine"?: "devin" | "codex", "defaultModel"?: string }`.
@@ -32,7 +32,7 @@ dependencies; do not modify their sources.
 ## Acceptance
 
 - `node packages/cli/dist/main.js doctor` works on this machine (both
-   engines resolve).
+  engines resolve).
 - Vitest coverage for config parsing (missing file, invalid JSON, unknown
-   key, precedence file < env < flag).
+  key, precedence file < env < flag).
 - `pnpm check` green.

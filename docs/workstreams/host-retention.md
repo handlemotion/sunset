@@ -29,6 +29,6 @@ slow `attach` reads.
 ## Acceptance
 
 - Tests in `host.test.ts`: old finished-run events are pruned on startup;
-   the cap writes the truncation marker and stops further inserts; attach
-   still streams correctly for a live run.
+  the cap writes the truncation marker and stops further inserts; attach
+  still streams correctly for a live run.
 - `pnpm check` green.

@@ -26,9 +26,9 @@ Make the ACP client resilient and capture event data we currently drop.
    - `session_info_update` → `{ type: "session_title"; title: string }` when
      `params.title` (or `_meta.title`) is present; ignore otherwise.
    - `available_commands_update` → `{ type: "commands"; commands: Array<{ name: string; description?: string }> }`.
-   Extend `asAgentEvent` in `map.ts` so persisted events round-trip.
-   Keep ignoring `config_option_update`, `compaction_*`, `plan_update`,
-   `plan_removed`, `user_message_chunk`.
+     Extend `asAgentEvent` in `map.ts` so persisted events round-trip.
+     Keep ignoring `config_option_update`, `compaction_*`, `plan_update`,
+     `plan_removed`, `user_message_chunk`.
 
 3. **Catalog cache TTL.** `codexCatalogCache` in `catalog.ts` never expires.
    Cache for 1 hour, then re-probe. Expose an internal `resetCatalogCache()`

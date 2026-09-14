@@ -33,6 +33,6 @@ WS upgrade. This task closes the remaining gaps.
 ## Acceptance
 
 - Tests in `server.test.ts`: 401 without token on WS upgrade, foreign Origin
-   rejected, localhost Origin accepted, >1 MB body → 413, sockets close on
-   server close.
+  rejected, localhost Origin accepted, >1 MB body → 413, sockets close on
+  server close.
 - `pnpm check` green.
