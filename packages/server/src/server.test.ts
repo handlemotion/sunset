@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { connect } from "node:net";
 import WebSocket from "ws";
 
 import type { Host, HostEvent } from "@sunset/host";
@@ -353,5 +354,24 @@ describe("createSunsetServer", () => {
     ]);
     releaseWait();
     await expect(pending).rejects.toThrow();
+  });
+
+  it("returns 400 for malformed HTTP request targets", async () => {
+    const server = await createSunsetServer({ host: stubHost() });
+    const response = await new Promise<string>((resolve, reject) => {
+      const socket = connect(server.port, "127.0.0.1", () =>
+        socket.end(
+          "GET http://[ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        ),
+      );
+      let data = "";
+      socket.on("data", (chunk) => {
+        data += chunk;
+      });
+      socket.on("error", reject);
+      socket.on("close", () => resolve(data));
+    });
+    expect(response.split("\r\n", 1)[0]).toBe("HTTP/1.1 400 Bad Request");
+    await server.close();
   });
 });

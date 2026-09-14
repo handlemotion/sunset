@@ -36,6 +36,13 @@ class PayloadTooLargeError extends Error {
   }
 }
 
+class InvalidRequestTargetError extends Error {
+  constructor() {
+    super("invalid request target");
+    this.name = "InvalidRequestTargetError";
+  }
+}
+
 type LogEntry = {
   level: "info" | "error";
   msg: string;
@@ -74,6 +81,12 @@ function fail(response: ServerResponse, error: unknown): void {
     response.setHeader("connection", "close");
     json(response, 413, {
       error: { code: "payload_too_large", message: error.message },
+    });
+    return;
+  }
+  if (error instanceof InvalidRequestTargetError) {
+    json(response, 400, {
+      error: { code: "invalid_request_target", message: error.message },
     });
     return;
   }
@@ -131,6 +144,22 @@ function originAllowed(request: IncomingMessage): boolean {
     return ALLOWED_ORIGIN_HOSTNAMES.has(new URL(origin).hostname.toLowerCase());
   } catch {
     return false;
+  }
+}
+
+function requestPath(request: IncomingMessage): string {
+  try {
+    return new URL(request.url ?? "/", "http://127.0.0.1").pathname;
+  } catch {
+    return "/";
+  }
+}
+
+function requestURL(request: IncomingMessage): URL {
+  try {
+    return new URL(request.url ?? "/", "http://127.0.0.1");
+  } catch {
+    throw new InvalidRequestTargetError();
   }
 }
 
@@ -213,24 +242,22 @@ export async function createSunsetServer(
   let forcedShutdown = false;
   const server: Server = createHttpServer((request, response) => {
     const startedAt = Date.now();
-    const url = new URL(request.url ?? "/", "http://127.0.0.1");
     const method = request.method ?? "GET";
-    const pending = handleRequest(request, response, url).catch(
-      (error: unknown) => {
-        if (!forcedShutdown && !(error instanceof PayloadTooLargeError)) {
-          log({
-            level: "error",
-            msg: "handler_error",
-            method,
-            path: url.pathname,
-            err: errorMessage(error),
-          });
-        }
-        if (!response.destroyed && !response.writableEnded) {
-          fail(response, error);
-        }
-      },
-    );
+    const pathname = requestPath(request);
+    const pending = handleRequest(request, response).catch((error: unknown) => {
+      if (!forcedShutdown && !(error instanceof PayloadTooLargeError)) {
+        log({
+          level: "error",
+          msg: "handler_error",
+          method,
+          path: pathname,
+          err: errorMessage(error),
+        });
+      }
+      if (!response.destroyed && !response.writableEnded) {
+        fail(response, error);
+      }
+    });
     inflight.add(pending);
     void pending.finally(() => {
       inflight.delete(pending);
@@ -239,7 +266,7 @@ export async function createSunsetServer(
           level: "info",
           msg: "request",
           method,
-          path: url.pathname,
+          path: pathname,
           status: response.statusCode,
           ms: Date.now() - startedAt,
         });
@@ -250,8 +277,8 @@ export async function createSunsetServer(
   async function handleRequest(
     request: IncomingMessage,
     response: ServerResponse,
-    url: URL,
   ): Promise<void> {
+    const url = requestURL(request);
     const pathname = url.pathname;
     const method = request.method ?? "GET";
 
@@ -558,6 +585,7 @@ export async function createSunsetServer(
             // ponytail: one global drain deadline; per-request deadlines if shutdown latency needs finer control
             forcedShutdown = true;
             server.closeAllConnections();
+            inflight.clear();
           }
           await httpClosed;
           await drainLog();
