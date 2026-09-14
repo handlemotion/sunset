@@ -192,6 +192,7 @@ export async function createSunsetServer(
 
   const logPath = process.env.SUNSET_LOG;
   let logTail: Promise<void> = Promise.resolve();
+  let logFailureReported = false;
   function log(entry: LogEntry): void {
     if (!logPath) return;
     const serialized = JSON.stringify({
@@ -199,7 +200,13 @@ export async function createSunsetServer(
       ...entry,
     });
     const line = `${token ? serialized.split(token).join("[redacted]") : serialized}\n`;
-    logTail = logTail.then(() => appendFile(logPath, line)).catch(() => {});
+    logTail = logTail
+      .then(() => appendFile(logPath, line))
+      .catch(() => {
+        if (logFailureReported) return;
+        logFailureReported = true;
+        process.stderr.write("sunset server log write failed\n");
+      });
   }
 
   const inflight = new Set<Promise<void>>();
