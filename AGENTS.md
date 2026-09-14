@@ -16,6 +16,7 @@ pnpm + turbo monorepo ([pnpm-workspace.yaml](pnpm-workspace.yaml),
 - `packages/git` (`@sunset/git`) — worktree lifecycle and mutation leases
 - `packages/acp` (`@sunset/acp`) — Agent Client Protocol client; devin/codex
   engine adapters
+- `packages/testing` (`@sunset/testing`) — shared fake ACP agent test harness
 - `packages/host` (`@sunset/host`) — sqlite-backed orchestration: projects,
   workspaces, sessions, runs, events
 - `packages/server` (`@sunset/server`) — localhost HTTP/WebSocket API and

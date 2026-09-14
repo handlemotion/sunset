@@ -73,8 +73,10 @@ behavior in [catalog.ts](../packages/acp/src/catalog.ts).
   host caches catalogs in sqlite and reports each engine's catalog as
   `live`, `cached`, or `unavailable`.
 - **Plan mode.** `mode: "plan"` maps to the first advertised mode id among
-  `plan`, `read-only`, `read_only` via `session/set_mode`. Codex advertises
-  `agent`/`plan` support; devin is `agent`-only.
+  `plan`, `read-only`, `read_only` via `session/set_mode`. The Sunset engine
+  interface exposes `agent`/`plan` for Codex; the ACP adapter supplies the
+  provider mode identifiers used for the `session/set_mode` request. Devin's
+  Sunset adapter exposes `agent` only.
 - **Process groups.** Engine children spawn `detached` on non-Windows so
   `kill()` signals the whole process group with `SIGKILL` — engines like
   `devin acp` spawn MCP-server children that would otherwise outlive the
