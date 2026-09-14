@@ -283,6 +283,14 @@ export function createState(database: SqliteDatabase) {
     insertRunEvent: database.prepare(
       "INSERT INTO run_events (run_id, sequence, event_json, created_at) VALUES (?, ?, ?, ?)",
     ),
+    pruneRunEvents: database.prepare(
+      `DELETE FROM run_events WHERE run_id IN (
+        SELECT id FROM runs
+        WHERE status IN ('finished', 'error', 'cancelled')
+          AND finished_at IS NOT NULL
+          AND finished_at < ?
+      )`,
+    ),
     runEventsAfter: database.prepare(
       "SELECT sequence, event_json FROM run_events WHERE run_id = ? AND sequence > ? ORDER BY sequence",
     ),
@@ -565,6 +573,9 @@ export function createState(database: SqliteDatabase) {
       createdAt: number,
     ): void {
       statements.insertRunEvent.run(runId, sequence, eventJson, createdAt);
+    },
+    pruneRunEvents(finishedBefore: number): number {
+      return statements.pruneRunEvents.run(finishedBefore).changes;
     },
     listRunEventsAfter(runId: string, sequence: number): RunEventRow[] {
       return statements.runEventsAfter.all(runId, sequence) as RunEventRow[];
