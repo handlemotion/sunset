@@ -4,6 +4,8 @@ import path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import type { Host } from "@sunset/host";
+
 import {
   configPath,
   loadConfig,
@@ -11,6 +13,7 @@ import {
   resolveConfig,
   type LoadedConfig,
 } from "./config.js";
+import { withSessionDefaults } from "./session-defaults.js";
 
 let dir: string;
 
@@ -230,5 +233,81 @@ describe("resolveConfig precedence", () => {
   it("propagates load warnings", () => {
     const resolved = resolveConfig(loaded({}, ["file warning"]), baseEnv());
     expect(resolved.warnings).toEqual(["file warning"]);
+  });
+});
+
+describe("session defaults", () => {
+  it("keeps the configured model's default variant parameters", async () => {
+    const calls: unknown[] = [];
+    const host = {
+      capabilities: async () => ({
+        engines: [
+          {
+            id: "codex",
+            modes: [],
+            models: [
+              {
+                id: "codex:gpt-6-astra",
+                displayName: "GPT-6 Astra",
+                aliases: ["gpt-6-astra"],
+                parameters: [
+                  {
+                    id: "effort",
+                    values: [{ value: "medium" }],
+                  },
+                ],
+                variants: [
+                  {
+                    params: [{ id: "effort", value: "medium" }],
+                    displayName: "GPT-6 Astra (medium)",
+                    isDefault: true,
+                  },
+                ],
+              },
+            ],
+            modelCatalog: { status: "live", fetchedAt: Date.now() },
+            executionPolicy: {
+              defaults: {
+                autoReview: false,
+                sandbox: { enabled: false },
+                agentRetries: false,
+                toolAllowlist: null,
+                toolDenylist: [],
+              },
+              controls: [],
+            },
+          },
+        ],
+      }),
+      sessions: {
+        create: async (input: Record<string, unknown>) => {
+          calls.push(input);
+          return input;
+        },
+      },
+    } as unknown as Host;
+    const wrapped = withSessionDefaults(host, {
+      stateDir: "/tmp/state",
+      worktreeRoot: "/tmp/worktrees",
+      defaultEngine: "codex",
+      defaultModel: "codex:gpt-6-astra",
+      configPath: "/tmp/config.json",
+      configFound: true,
+      warnings: [],
+      errors: [],
+    });
+
+    await wrapped.sessions.create({
+      workspaceId: "workspace",
+      prompt: "hello",
+    });
+
+    expect(calls[0]).toMatchObject({
+      engine: "codex",
+      model: {
+        id: "codex:gpt-6-astra",
+        params: [{ id: "effort", value: "medium" }],
+      },
+    });
   });
 });

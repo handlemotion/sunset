@@ -9,6 +9,7 @@ import type { EngineId, ModelCapability } from "@sunset/domain";
 import type { ResolvedConfig } from "./config.js";
 
 const ENGINE_IDS: EngineId[] = ["devin", "codex"];
+const CATALOG_TIMEOUT_MS = 15_000;
 
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
@@ -35,6 +36,26 @@ export function defaultModelId(models: ModelCapability[]): string | undefined {
   return preferred?.id;
 }
 
+function listModelsWithTimeout(engine: EngineId): Promise<ModelCapability[]> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(
+        new Error(`model catalog timed out after ${CATALOG_TIMEOUT_MS}ms`),
+      );
+    }, CATALOG_TIMEOUT_MS);
+    void listModels(engine).then(
+      (models) => {
+        clearTimeout(timer);
+        resolve(models);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 type EngineReport = {
   engine: EngineId;
   spawnOk: boolean;
@@ -59,7 +80,7 @@ async function checkEngine(engine: EngineId): Promise<EngineReport> {
 
   let catalog = "";
   try {
-    const models = await listModels(engine);
+    const models = await listModelsWithTimeout(engine);
     if (models.length === 0) {
       catalog = "empty catalog";
     } else {

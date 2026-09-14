@@ -4,11 +4,12 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { createHost, type Host } from "@sunset/host";
+import { createHost } from "@sunset/host";
 import { createSunsetServer } from "@sunset/server";
 
 import { loadConfig, resolveConfig, type ResolvedConfig } from "./config.js";
 import { runDoctor } from "./doctor.js";
+import { withSessionDefaults } from "./session-defaults.js";
 
 const HELP = `sunset — browser development workspace
 
@@ -99,31 +100,6 @@ function webDist(args: string[]): string | undefined {
   return bundled;
 }
 
-/**
- * Apply configured default engine/model to session creation when the caller
- * (e.g. the web UI) leaves them unset.
- */
-function withSessionDefaults(host: Host, config: ResolvedConfig): Host {
-  const engine = config.defaultEngine;
-  const model = config.defaultModel;
-  if (!engine && !model) return host;
-  const create = host.sessions.create;
-  return {
-    ...host,
-    sessions: {
-      ...host.sessions,
-      create: (input) =>
-        create({
-          ...input,
-          ...(input.engine === undefined && engine ? { engine } : {}),
-          ...(input.model === undefined && model
-            ? { model: { id: model, params: [] } }
-            : {}),
-        }),
-    },
-  };
-}
-
 async function openBrowser(url: string): Promise<void> {
   const opener =
     process.platform === "darwin"
@@ -196,8 +172,7 @@ async function main(): Promise<void> {
   }
 
   if (command === "doctor") {
-    process.exitCode = await runDoctor(resolved, await cliVersion());
-    return;
+    process.exit(await runDoctor(resolved, await cliVersion()));
   }
   for (const warning of resolved.warnings) {
     console.error(`warning: ${warning}`);
