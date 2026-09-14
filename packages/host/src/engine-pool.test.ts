@@ -68,8 +68,12 @@ type FakeRunScript = {
 
 function fakeEngine(
   scripts: FakeRunScript[] = [],
-  options: { blockFirstDispose?: boolean } = {},
+  options: { blockFirstCreate?: boolean; blockFirstDispose?: boolean } = {},
 ) {
+  let releaseFirstCreate!: () => void;
+  const firstCreate = new Promise<void>((resolve) => {
+    releaseFirstCreate = resolve;
+  });
   let releaseFirstDispose!: () => void;
   const firstDispose = new Promise<void>((resolve) => {
     releaseFirstDispose = resolve;
@@ -143,6 +147,9 @@ function fakeEngine(
     supportedModes: () => ["agent"],
     async create(input) {
       state.creates.push(input);
+      if (options.blockFirstCreate && state.creates.length === 1) {
+        await firstCreate;
+      }
       return handle(`fake-provider-${state.creates.length}`);
     },
     async resume(input) {
@@ -150,7 +157,7 @@ function fakeEngine(
       return handle(input.providerSessionId);
     },
   };
-  return { engine, state, releaseFirstDispose };
+  return { engine, state, releaseFirstCreate, releaseFirstDispose };
 }
 
 async function setup(
@@ -325,6 +332,27 @@ describe("engine pool", () => {
     expect(state.resumes).toEqual([]);
 
     await host.close();
+  });
+
+  it("waits for an in-flight engine creation during shutdown", async () => {
+    const { engine, state, releaseFirstCreate } = fakeEngine([{ events: [] }], {
+      blockFirstCreate: true,
+    });
+    const { host, workspaceId } = await setup(engine);
+    const creating = host.sessions.create({ workspaceId, prompt: "one" });
+    await eventually(() => expect(state.creates).toHaveLength(1));
+
+    let closed = false;
+    const closing = host.close().then(() => {
+      closed = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(closed).toBe(false);
+
+    releaseFirstCreate();
+    await expect(creating).rejects.toMatchObject({ code: "host_closed" });
+    await closing;
+    expect(state.disposes).toEqual(["fake-provider-1"]);
   });
 
   it("counts a retiring engine until disposal completes", async () => {

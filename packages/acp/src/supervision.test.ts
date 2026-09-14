@@ -249,12 +249,14 @@ describe("engine process supervision", () => {
         }),
       );
       writeFileSync(path.join(dir, "corrupt.json"), "not json");
+      await mkdir(path.join(dir, "undeletable.json"));
       writeFileSync(path.join(dir, "keep.txt"), "not a marker");
 
       reapOrphanedEngineGroups(dir);
 
       expect(existsSync(markerFile(dir, dead))).toBe(false);
       expect(existsSync(path.join(dir, "corrupt.json"))).toBe(false);
+      expect(existsSync(path.join(dir, "undeletable.json"))).toBe(true);
       expect(existsSync(path.join(dir, "keep.txt"))).toBe(true);
     },
   );

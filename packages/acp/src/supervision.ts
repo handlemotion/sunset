@@ -45,6 +45,14 @@ function markerPath(dir: string, leaderPid: number): string {
   return path.join(dir, `${leaderPid}.json`);
 }
 
+function removeMarker(file: string): void {
+  try {
+    rmSync(file, { force: true });
+  } catch {
+    // Marker cleanup is best-effort; startup must not fail on an undeletable entry.
+  }
+}
+
 function isMarker(value: unknown): value is EngineGroupMarker {
   if (typeof value !== "object" || value === null) return false;
   const marker = value as {
@@ -130,7 +138,7 @@ export function reapOrphanedEngineGroups(dir: string): void {
       // An unreadable marker is stale.
     }
     if (!marker || marker.host.start === "" || marker.leader.start === "") {
-      rmSync(file, { force: true });
+      removeMarker(file);
       continue;
     }
     const hostNow = startIdentity(marker.host.pid);
@@ -140,7 +148,7 @@ export function reapOrphanedEngineGroups(dir: string): void {
       // a dead or reused leader leaves a stale marker that is removed, never
       // killed.
       if (leaderNow === marker.leader.start) continue;
-      rmSync(file, { force: true });
+      removeMarker(file);
       continue;
     }
     const hostGone = hostNow !== undefined || pidGone(marker.host.pid);
@@ -151,6 +159,6 @@ export function reapOrphanedEngineGroups(dir: string): void {
         // The group already exited.
       }
     }
-    rmSync(file, { force: true });
+    removeMarker(file);
   }
 }

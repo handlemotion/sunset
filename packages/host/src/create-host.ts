@@ -150,7 +150,12 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
   const worktreeRoot = await realpath(options.worktreeRoot);
   const hostLease = await acquireHostLease(stateDir, leaseTimeoutMs);
   const engineGroupDir = path.join(stateDir, "engine-groups");
-  reapOrphanedEngineGroups(engineGroupDir);
+  try {
+    reapOrphanedEngineGroups(engineGroupDir);
+  } catch (error) {
+    await hostLease.release();
+    throw error;
+  }
   const sqlitePath = path.join(stateDir, "sunset.sqlite");
   let database: InstanceType<typeof Database>;
   try {
@@ -189,6 +194,7 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
   const enginePool = new Map<string, EnginePoolEntry>();
   const engineClaims = new Map<string, number>();
   const retiringEngineDisposals = new Map<string, Set<Promise<void>>>();
+  const pendingEngineCreations = new Set<Promise<unknown>>();
   const capacityWaiters = new Map<string, CapacityWaiter[]>();
   const capacityWaiterCancellers = new Map<string, () => void>();
   const activeRuns = new Map<string, EngineRun>();
@@ -467,7 +473,10 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
       if (closing) {
         throw new HostError("host is closed", "host_closed");
       }
-      if (runId && cancelRequested.has(runId)) return false;
+      if (runId && cancelRequested.has(runId)) {
+        signalEngineCapacity(workspaceId);
+        return false;
+      }
       const waiters = capacityWaiters.get(workspaceId);
       if (!waiters?.length || queued) {
         if (liveEngineCount(workspaceId) < maxEnginesPerWorkspace) {
@@ -1200,6 +1209,7 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
             ),
           );
         }
+        await Promise.allSettled([...pendingEngineCreations]);
         await Promise.all([...schedulers.values()]);
         await Promise.all(
           [...enginePool.values()].map((entry) => {
@@ -1491,7 +1501,7 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
           defaultExecutionPolicy,
         );
         await ensureEngineCapacity(workspace.id);
-        try {
+        const creation = (async () => {
           const handle = await engineFor(engine).create({
             cwd: workspace.worktreePath,
             model,
@@ -1526,7 +1536,12 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
           registerEngineEntry(session.id, workspace.id, handle);
           scheduleSession(session.id);
           return { session, run };
+        })();
+        pendingEngineCreations.add(creation);
+        try {
+          return await creation;
         } finally {
+          pendingEngineCreations.delete(creation);
           releaseEngineCapacity(workspace.id);
         }
       },
