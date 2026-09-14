@@ -30,6 +30,7 @@ import type {
 } from "./types.js";
 
 const PLAN_MODE_CANDIDATES = ["plan", "read-only", "read_only"];
+const SESSION_CLOSE_TIMEOUT_MS = 2_000;
 
 function isAuthError(error: unknown): boolean {
   return (
@@ -135,6 +136,24 @@ class AcpSession implements EngineSessionHandle {
   }
 
   async dispose(): Promise<void> {
+    const sessionId = this.providerSessionId;
+    if (sessionId) {
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          this.conn.request("session/close", { sessionId }),
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, SESSION_CLOSE_TIMEOUT_MS);
+            timer.unref();
+          }),
+        ]);
+      } catch {
+        // Unsupported or rejected session/close still falls through to
+        // transport close and process-group teardown.
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
     this.conn.close();
   }
 }
@@ -200,7 +219,7 @@ async function applyMode(
 
 export function createEngine(
   definition: EngineDefinition,
-  options?: { connector?: AcpConnector },
+  options?: { connector?: AcpConnector; engineGroupDir?: string },
 ): Engine {
   async function connectorFor(input: CreateEngineInput, session: AcpSession) {
     const model = input.model.id
@@ -216,6 +235,9 @@ export function createEngine(
           command: spawn ? spawn.command : definition.command,
           args: [...(spawn?.args ?? []), ...definition.args(modelInput)],
           ...(definition.env ? { env: definition.env(modelInput) } : {}),
+          ...(options?.engineGroupDir
+            ? { engineGroupDir: options.engineGroupDir }
+            : {}),
         });
       })());
     return connector({
