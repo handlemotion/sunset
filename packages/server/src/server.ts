@@ -26,6 +26,8 @@ const MIME: Record<string, string> = {
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const SHUTDOWN_DRAIN_TIMEOUT_MS = 1000;
+const STREAM_DRAINED_CLOSE_CODE = 1000;
+const STREAM_SHUTDOWN_CLOSE_CODE = 1001;
 
 const ALLOWED_ORIGIN_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
@@ -174,7 +176,7 @@ function closeSocket(ws: WebSocket): Promise<void> {
       clearTimeout(timer);
       resolve();
     });
-    ws.close();
+    ws.close(STREAM_SHUTDOWN_CLOSE_CODE);
   });
 }
 
@@ -533,7 +535,7 @@ export async function createSunsetServer(
             );
           }
         } finally {
-          if (ws.readyState === ws.OPEN) ws.close();
+          if (ws.readyState === ws.OPEN) ws.close(STREAM_DRAINED_CLOSE_CODE);
         }
       })();
     });

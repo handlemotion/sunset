@@ -229,13 +229,18 @@ describe("createSunsetServer", () => {
       `${server.url.replace("http", "ws")}/api/runs/r1/events?token=${server.token}`,
     );
     const received: unknown[] = [];
+    let closeCode: number | undefined;
     await new Promise<void>((resolve, reject) => {
       ws.on("message", (data) => received.push(JSON.parse(String(data))));
-      ws.on("close", () => resolve());
+      ws.on("close", (code) => {
+        closeCode = code;
+        resolve();
+      });
       ws.on("error", reject);
       setTimeout(() => reject(new Error("ws timeout")), 5000);
     });
     expect(received).toHaveLength(2);
+    expect(closeCode).toBe(1000);
     await server.close();
   });
 
@@ -312,8 +317,12 @@ describe("createSunsetServer", () => {
     const ws = new WebSocket(
       `${server.url.replace("http", "ws")}/api/runs/r1/events?token=${server.token}`,
     );
+    let closeCode: number | undefined;
     const closed = new Promise<void>((resolve) =>
-      ws.on("close", () => resolve()),
+      ws.on("close", (code) => {
+        closeCode = code;
+        resolve();
+      }),
     );
     await new Promise<void>((resolve, reject) => {
       ws.on("open", () => resolve());
@@ -323,6 +332,7 @@ describe("createSunsetServer", () => {
     await server.close();
     await closed;
     expect(ws.readyState).toBe(WebSocket.CLOSED);
+    expect(closeCode).toBe(1001);
   });
 
   it("aborts a pending HTTP handler when shutdown cannot drain it", async () => {

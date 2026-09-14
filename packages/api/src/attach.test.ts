@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { HostEvent, Run, RunStatus } from "@sunset/domain";
 
-import { createClient, RunStreamError } from "./index.js";
+import { ApiError, createClient, RunStreamError } from "./index.js";
 
 const BASE = "http://sunset.test";
 const TOKEN = "tok-123";
@@ -66,7 +66,15 @@ class FakeWebSocket {
     if (this.closed) return;
     this.closed = true;
     this.readyState = 3;
-    this.emit("close", { code: 1005, wasClean: true });
+    this.emit("close", { code: 1000, wasClean: true });
+  }
+
+  /** Test helper: server shuts down before the stream is drained. */
+  serverShutdown(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.readyState = 3;
+    this.emit("close", { code: 1001, wasClean: true });
   }
 
   /** Test helper: the connection drops without a closing handshake. */
@@ -140,6 +148,19 @@ describe("attachRun", () => {
     expect(() => client.attachRun("r1", { after: NaN })).toThrow(RangeError);
   });
 
+  it("validates `reconnectDelayMs` is finite within [1, 2147483647]", () => {
+    const client = createClient({ baseUrl: BASE, token: TOKEN });
+    for (const delay of [0, -1, 0.5, NaN, Infinity, 2147483648]) {
+      expect(() => client.attachRun("r1", { reconnectDelayMs: delay })).toThrow(
+        RangeError,
+      );
+    }
+    expect(() => client.attachRun("r1", { reconnectDelayMs: 1 })).not.toThrow();
+    expect(() =>
+      client.attachRun("r1", { reconnectDelayMs: 2147483647 }),
+    ).not.toThrow();
+  });
+
   it("streams events after the initial sequence and resumes from the latest on drop", async () => {
     let status: RunStatus = "running";
     stubRunStatus(() => status);
@@ -210,6 +231,32 @@ describe("attachRun", () => {
     expect(FakeWebSocket.instances).toHaveLength(2);
   });
 
+  it("reconnects on a clean shutdown close even when the run is terminal", async () => {
+    stubRunStatus(() => "finished");
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+
+    const client = createClient({ baseUrl: BASE, token: TOKEN });
+    const iterator = client
+      .attachRun("r1", { reconnectDelayMs: 1 })
+      [Symbol.asyncIterator]();
+
+    let next = iterator.next();
+    const ws1 = FakeWebSocket.instances[0]!;
+    ws1.message(ev(5));
+    expect((await next).value).toMatchObject({ sequence: 5 });
+
+    ws1.serverShutdown();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
+    const ws2 = FakeWebSocket.instances[1]!;
+    expect(ws2.url).toContain("after=5");
+
+    next = iterator.next();
+    ws2.message(ev(6));
+    expect((await next).value).toMatchObject({ sequence: 6 });
+    ws2.serverClose();
+    expect((await iterator.next()).done).toBe(true);
+  });
+
   it("ends the stream on a clean close with a terminal run, draining buffered events", async () => {
     stubRunStatus(() => "finished");
     vi.stubGlobal("WebSocket", FakeWebSocket);
@@ -232,6 +279,85 @@ describe("attachRun", () => {
     expect((await iterator.next()).value).toMatchObject({ sequence: 2 });
     expect((await iterator.next()).done).toBe(true);
     expect(FakeWebSocket.instances).toHaveLength(1);
+  });
+
+  it.each([401, 403])(
+    "fails the iterator on HTTP %i instead of retrying",
+    async (status) => {
+      vi.stubGlobal(
+        "fetch",
+        async () =>
+          new Response(
+            JSON.stringify({
+              error: {
+                code: "unauthorized",
+                message: "invalid boot token",
+              },
+            }),
+            { status, headers: { "content-type": "application/json" } },
+          ),
+      );
+      vi.stubGlobal("WebSocket", FakeWebSocket);
+
+      const client = createClient({ baseUrl: BASE, token: "bad" });
+      const iterator = client
+        .attachRun("r1", { reconnectDelayMs: 1 })
+        [Symbol.asyncIterator]();
+
+      const pending = iterator.next();
+      FakeWebSocket.instances[0]!.drop();
+
+      const error = await pending.catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(ApiError);
+      expect(error).toMatchObject({
+        status,
+        code: "unauthorized",
+        message: "invalid boot token",
+      });
+      await sleep(30);
+      expect(FakeWebSocket.instances).toHaveLength(1);
+    },
+  );
+
+  it("retries the status check when getRun fails transiently", async () => {
+    let status: RunStatus = "running";
+    let calls = 0;
+    vi.stubGlobal("fetch", async () => {
+      calls += 1;
+      if (calls === 1) throw new Error("network down");
+      return new Response(JSON.stringify(runWith(status)), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+
+    const client = createClient({ baseUrl: BASE, token: TOKEN });
+    const iterator = client
+      .attachRun("r1", { reconnectDelayMs: 1 })
+      [Symbol.asyncIterator]();
+
+    const pending = iterator.next();
+    FakeWebSocket.instances[0]!.drop();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
+
+    status = "finished";
+    FakeWebSocket.instances[1]!.serverClose();
+    expect((await pending).done).toBe(true);
+  });
+
+  it("fails explicitly when the run is missing after an unclean close", async () => {
+    stubRunStatus(() => null);
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+
+    const client = createClient({ baseUrl: BASE, token: TOKEN });
+    const iterator = client
+      .attachRun("r1", { reconnectDelayMs: 1 })
+      [Symbol.asyncIterator]();
+
+    const pending = iterator.next();
+    FakeWebSocket.instances[0]!.drop();
+    await expect(pending).rejects.toThrow(/run r1 not found/);
   });
 
   it("ends the stream on a clean close when the run no longer exists", async () => {

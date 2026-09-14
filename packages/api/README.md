@@ -36,13 +36,16 @@ for await (const event of client.attachRun(run.id)) {
     default `0`). On reconnect the stream resumes from the latest sequence
     received, and replayed events (`sequence <= cursor`) are suppressed.
   - The server sends no terminal frame; it closes the socket cleanly once
-    the run's event log is drained. On a clean close (`wasClean`) the client
-    calls `getRun`: terminal statuses (`finished`, `error`, `cancelled`) or a
-    missing run end the stream; any other state reconnects. An unclean close
-    always reconnects from the last seen sequence — a terminal HTTP status
-    cannot prove the final events were delivered. Reconnects are spaced by
-    `reconnectDelayMs` (default 250ms) so there is no busy loop. Buffered
-    events are drained before the iterator completes.
+    the run's event log is drained and closes with WebSocket code `1000`.
+    Every other close — clean or unclean — is confirmed with an authenticated
+    `getRun`: `401`/`403` fails the iterator (auth errors are permanent, not
+    retried), a drained close on a terminal (`finished`, `error`, `cancelled`)
+    or missing run ends the stream, a missing run on any other close fails
+    explicitly, and any other state reconnects from the last seen sequence —
+    a terminal HTTP status cannot prove the final events were delivered.
+    Reconnects are spaced by `reconnectDelayMs` (default 250ms, must be finite
+    in `[1, 2147483647]` or `RangeError` is thrown) so there is no busy loop.
+    Buffered events are drained before the iterator completes.
   - A bare `{ type: "error", message }` frame (no sequence) throws
     `RunStreamError`; a sequenced `error` HostEvent is yielded normally.
     Malformed JSON fails the iterator, as do malformed event envelopes

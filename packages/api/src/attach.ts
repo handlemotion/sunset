@@ -58,6 +58,7 @@ const TERMINAL_STATUSES: ReadonlySet<string> = new Set([
   "error",
   "cancelled",
 ]);
+const DRAINED_CLOSE_CODE = 1000;
 
 const KNOWN_EVENT_TYPES: ReadonlySet<string> = new Set([
   "text_delta",
@@ -109,11 +110,12 @@ const DONE: IteratorResult<HostEvent> = { value: undefined, done: true };
  * Streams run events over the run-events WebSocket.
  *
  * The server sends no explicit terminal frame: it closes the socket cleanly
- * when the run's event log is drained. A clean close (`wasClean`) confirms
- * the run via `getRun` — terminal (or missing) ends the stream, anything else
- * reconnects. An unclean close always reconnects from the last delivered
- * sequence, even when the run is already terminal, because a terminal status
- * cannot prove the final events crossed the socket.
+ * when the run's event log is drained with WebSocket close code 1000. Every
+ * other close is confirmed via `getRun`: auth failures (401/403) fail the
+ * iterator, a drained close on a terminal (or missing) run ends it, a
+ * missing run on any other close fails, and anything else reconnects from
+ * the last delivered sequence — a terminal status alone cannot prove the
+ * final events crossed the socket.
  */
 export function attachRunEvents(
   context: AttachRunContext,
@@ -127,6 +129,16 @@ export function attachRunEvents(
     );
   }
   const reconnectDelayMs = options.reconnectDelayMs ?? 250;
+  if (
+    typeof reconnectDelayMs !== "number" ||
+    !Number.isFinite(reconnectDelayMs) ||
+    reconnectDelayMs < 1 ||
+    reconnectDelayMs > 2147483647
+  ) {
+    throw new RangeError(
+      "attachRun: `reconnectDelayMs` must be a finite number within [1, 2147483647]",
+    );
+  }
   const signal = options.signal;
 
   return {
@@ -181,11 +193,7 @@ export function attachRunEvents(
 
       const onClose = (event: CloseFrame) => {
         detachSocket();
-        if (event.wasClean === true) {
-          void decide();
-        } else {
-          scheduleReconnect();
-        }
+        void decide(event.code === DRAINED_CLOSE_CODE);
       };
 
       const onError = () => {
@@ -248,16 +256,31 @@ export function attachRunEvents(
         for (const waiter of waiters.splice(0)) waiter.resolve(DONE);
       }
 
-      async function decide() {
+      async function decide(drainedClose: boolean) {
         let run: Run | null;
         try {
           run = await context.getRun(runId);
-        } catch {
-          if (!ended) scheduleReconnect();
+        } catch (error) {
+          if (ended) return;
+          // Auth failures are permanent — surface them instead of retrying.
+          // `status` is read structurally to keep attach.ts dependency-free.
+          const status = (error as { status?: unknown } | null)?.status;
+          if (status === 401 || status === 403) {
+            fail(error);
+            return;
+          }
+          scheduleReconnect();
           return;
         }
         if (ended) return;
-        if (run === null || TERMINAL_STATUSES.has(run.status)) {
+        if (run === null) {
+          if (drainedClose) finish();
+          else fail(new Error(`attachRun: run ${runId} not found`));
+          return;
+        }
+        // A terminal status without the drained close code cannot prove the
+        // final events were delivered — reconnect and let replay drain them.
+        if (drainedClose && TERMINAL_STATUSES.has(run.status)) {
           finish();
           return;
         }
