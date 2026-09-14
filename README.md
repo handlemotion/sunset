@@ -10,11 +10,59 @@ sandboxes.
 ```sh
 pnpm install
 pnpm build
-pnpm --filter @sunset/cli exec sunset
+pnpm --filter @sunset/cli exec sunset open
 ```
 
-`sunset` starts the local host daemon, serves the web UI on localhost, and opens
-your browser. Local agent sessions need `devin auth login` and/or `codex login`.
+`sunset open` starts the local host daemon, serves the web UI on localhost, and
+opens your browser (`sunset serve` does the same without opening a browser).
+Local agent sessions need `devin auth login` and/or `codex login`.
+
+## CLI
+
+```sh
+sunset serve|open [--port N] [--state-dir DIR] [--worktree-root DIR]
+                  [--web-dist DIR] [--engine devin|codex] [--model ID]
+sunset doctor    # check engine binaries, model catalogs, and state dir
+sunset projects add <repo-root> | list
+sunset workspaces create <project-id> <slug> | list <project-id>
+sunset capabilities
+sunset --version | --help
+```
+
+`sunset doctor` verifies that both engines can be spawned (`devin` on PATH;
+`codex-acp` on PATH, falling back to the pinned
+`npx -y @agentclientprotocol/codex-acp@1.11.0`), fetches each model catalog,
+and checks that the state directory is writable. It exits nonzero until both
+engines resolve.
+
+### Config file
+
+`sunset` reads `~/.config/sunset/config.json` (override the path with
+`SUNSET_CONFIG`). All keys are optional; unknown keys and invalid values warn
+and are ignored:
+
+```json
+{
+  "port": 8080,
+  "stateDir": "/path/to/state",
+  "defaultEngine": "codex",
+  "defaultModel": "codex:gpt-6-astra"
+}
+```
+
+`port` sets the `serve`/`open` listen port, `stateDir` the state directory,
+and `defaultEngine`/`defaultModel` fill in the engine and model for sessions
+created without them. Values resolve file < environment < CLI flag.
+
+### Environment variables
+
+- `SUNSET_CONFIG` — config file path
+- `SUNSET_STATE_DIR` — state root (state dir is `$SUNSET_STATE_DIR/state`;
+  default `~/.local/share/sunset`)
+- `SUNSET_PORT` — default `serve`/`open` port
+- `SUNSET_DEFAULT_ENGINE` — `devin` or `codex`
+- `SUNSET_DEFAULT_MODEL` — default model id
+- `SUNSET_WEB_DIST` — web build directory (default bundled `apps/web/dist`)
 
 ## Layout
 

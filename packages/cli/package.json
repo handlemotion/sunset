@@ -16,6 +16,7 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
+    "@sunset/acp": "workspace:*",
     "@sunset/domain": "workspace:*",
     "@sunset/host": "workspace:*",
     "@sunset/server": "workspace:*"
