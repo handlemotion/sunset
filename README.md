@@ -30,6 +30,14 @@ your browser. Local agent sessions need `devin auth login` and/or `codex login`.
 - `packages/box`, `packages/publish` — cloud sandbox + GitHub publication
   (dormant)
 
+## Docs
+
+- [AGENTS.md](AGENTS.md) — repo commands and rules for agents/contributors
+- [docs/architecture.md](docs/architecture.md) — local-first runtime map and
+  the dormant cloud boundary
+- [docs/protocol.md](docs/protocol.md) — the ACP surface and engine quirks
+- [docs/workstreams/README.md](docs/workstreams/README.md) — workstream briefs
+
 ## Status
 
 Early build. Local mode is the working product; cloud delegation is ported but
