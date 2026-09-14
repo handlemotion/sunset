@@ -164,6 +164,40 @@ importers:
         specifier: 3.2.4
         version: 3.2.4(@types/node@22.20.2)(jiti@2.7.0)(lightningcss@1.32.0)(supports-color@10.2.2)
 
+  packages/cloud:
+    dependencies:
+      "@agentclientprotocol/sdk":
+        specifier: 1.4.0
+        version: 1.4.0(zod@4.6.2)
+      "@sunset/acp":
+        specifier: workspace:*
+        version: link:../acp
+      "@sunset/domain":
+        specifier: workspace:*
+        version: link:../domain
+      ws:
+        specifier: ^8.18.0
+        version: 8.21.3
+    devDependencies:
+      "@sunset/box":
+        specifier: workspace:*
+        version: link:../box
+      "@sunset/typescript-config":
+        specifier: workspace:*
+        version: link:../typescript-config
+      "@types/node":
+        specifier: ^22.15.0
+        version: 22.20.2
+      "@types/ws":
+        specifier: ^8.18.0
+        version: 8.18.1
+      typescript:
+        specifier: 5.9.2
+        version: 5.9.2
+      vitest:
+        specifier: 3.2.4
+        version: 3.2.4(@types/node@22.20.2)(jiti@2.7.0)(lightningcss@1.32.0)(supports-color@10.2.2)
+
   packages/domain:
     devDependencies:
       "@sunset/typescript-config":

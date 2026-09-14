@@ -1,0 +1,38 @@
+{
+  "name": "@sunset/cloud",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "check-types": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "1.4.0",
+    "@sunset/acp": "workspace:*",
+    "@sunset/domain": "workspace:*",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@sunset/box": "workspace:*",
+    "@sunset/typescript-config": "workspace:*",
+    "@types/node": "^22.15.0",
+    "@types/ws": "^8.18.0",
+    "typescript": "5.9.2",
+    "vitest": "3.2.4"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}

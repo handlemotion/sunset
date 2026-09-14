@@ -1,5 +1,13 @@
 import { z } from "zod";
 
+import {
+  cfWebSocketUpgrade,
+  openBoxExecSession,
+  type BoxExecSession,
+  type BoxExecSessionStart,
+  type BoxSocketOpen,
+} from "./exec-session.js";
+
 const BOX_API = "https://us-east-1.box.upstash.com";
 const DEFAULT_MAX_BUNDLE_BYTES = 64 * 1024 * 1024;
 
@@ -149,6 +157,26 @@ export class BoxClient {
         })),
       timeoutMs + 1_000,
     );
+  }
+
+  /**
+   * Open a live exec session (`GET /v2/box/{id}/exec-session` upgraded to
+   * WebSocket). The session owns the spawned process: closing the socket kills
+   * it. `options.open` swaps the transport — tests inject a local socket.
+   */
+  execSession(
+    input: BoxExecSessionStart,
+    options?: { open?: BoxSocketOpen; handshakeTimeoutMs?: number },
+  ): Promise<BoxExecSession> {
+    return openBoxExecSession({
+      ...input,
+      url: `${BOX_API}/v2/box/${this.id}/exec-session`,
+      headers: { "x-box-api-key": this.apiKey },
+      open: options?.open ?? cfWebSocketUpgrade,
+      ...(options?.handshakeTimeoutMs !== undefined
+        ? { handshakeTimeoutMs: options.handshakeTimeoutMs }
+        : {}),
+    });
   }
 
   write(path: string, content: string, encoding?: "base64"): Promise<void> {
