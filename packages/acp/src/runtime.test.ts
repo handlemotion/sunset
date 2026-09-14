@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   agent as acpAgent,
@@ -60,7 +60,10 @@ function fakeAgent(): AgentApp {
   return app;
 }
 
-function inProcessConnector(build: () => AgentApp): AcpConnector {
+function inProcessConnector(
+  build: () => AgentApp,
+  onClose?: () => void,
+): AcpConnector {
   return async ({ onUpdate, onPermission }) => {
     const app = acpClient({ name: "sunset-test" });
     app.onNotification("session/update", (ctx) => {
@@ -78,12 +81,46 @@ function inProcessConnector(build: () => AgentApp): AcpConnector {
     return {
       request: conn.agent.request.bind(conn.agent),
       notify: conn.agent.notify.bind(conn.agent),
-      close: () => conn.close(),
+      close: () => {
+        onClose?.();
+        conn.close();
+      },
     };
   };
 }
 
+afterEach(() => {
+  vi.useRealTimers();
+});
+
 describe("createEngine over ACP", () => {
+  it("bounds hung engine startup and closes its transport", async () => {
+    vi.useFakeTimers();
+    const app = acpAgent({ name: "hung-acp" });
+    app.onRequest("initialize", () => new Promise<never>(() => undefined));
+    let closed = false;
+    const engine = createEngine(ENGINES.devin, {
+      connector: inProcessConnector(
+        () => app,
+        () => {
+          closed = true;
+        },
+      ),
+    });
+
+    const creating = engine.create({
+      cwd: "/tmp",
+      model: { id: "default", params: [] },
+    });
+    const rejection = expect(creating).rejects.toThrow(
+      "engine_startup_timeout",
+    );
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    await rejection;
+    expect(closed).toBe(true);
+  });
+
   it("creates a session, streams events, and waits for the run", async () => {
     const engine = createEngine(ENGINES.devin, {
       connector: inProcessConnector(fakeAgent),

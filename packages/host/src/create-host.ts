@@ -59,6 +59,7 @@ function now(): number {
 const DEFAULT_LEASE_TIMEOUT_MS = 5_000;
 const DEFAULT_ENGINE_IDLE_TTL_MS = 600_000;
 const DEFAULT_MAX_ENGINES_PER_WORKSPACE = 5;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 type EnginePoolEntry = {
   sessionId: string;
@@ -122,8 +123,15 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
     throw new HostError("leaseTimeoutMs must be positive", "invalid_options");
   }
   const engineIdleTtlMs = options.engineIdleTtlMs ?? DEFAULT_ENGINE_IDLE_TTL_MS;
-  if (!Number.isFinite(engineIdleTtlMs) || engineIdleTtlMs <= 0) {
-    throw new HostError("engineIdleTtlMs must be positive", "invalid_options");
+  if (
+    !Number.isFinite(engineIdleTtlMs) ||
+    engineIdleTtlMs <= 0 ||
+    engineIdleTtlMs > MAX_TIMER_DELAY_MS
+  ) {
+    throw new HostError(
+      `engineIdleTtlMs must be between 1 and ${MAX_TIMER_DELAY_MS}`,
+      "invalid_options",
+    );
   }
   const maxEnginesPerWorkspace =
     options.maxEnginesPerWorkspace ?? DEFAULT_MAX_ENGINES_PER_WORKSPACE;

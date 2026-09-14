@@ -212,6 +212,9 @@ describe("engine pool", () => {
       ).rejects.toMatchObject({ code: "invalid_options" });
     }
     await expect(
+      createHost({ ...base, engineIdleTtlMs: 2_147_483_648 }),
+    ).rejects.toMatchObject({ code: "invalid_options" });
+    await expect(
       createHost({ ...base, maxEnginesPerWorkspace: 1.5 }),
     ).rejects.toMatchObject({ code: "invalid_options" });
   });
