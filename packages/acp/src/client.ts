@@ -11,6 +11,8 @@ import {
   type SessionNotification,
 } from "@agentclientprotocol/sdk";
 
+import { trackEngineGroup } from "./supervision.js";
+
 export type UpdateHandler = (
   sessionId: string,
   update: SessionNotification["update"],
@@ -32,6 +34,7 @@ export type SpawnFn = (input: {
   args: string[];
   cwd: string;
   env: NodeJS.ProcessEnv;
+  engineGroupDir?: string;
 }) => SpawnedProcess;
 
 export function nodeSpawn(input: {
@@ -39,6 +42,7 @@ export function nodeSpawn(input: {
   args: string[];
   cwd: string;
   env: NodeJS.ProcessEnv;
+  engineGroupDir?: string;
 }): SpawnedProcess {
   const child: ChildProcess = spawn(input.command, input.args, {
     cwd: input.cwd,
@@ -53,9 +57,21 @@ export function nodeSpawn(input: {
     child.kill("SIGKILL");
     throw new Error("spawn_stdio_unavailable");
   }
+  const untrack =
+    process.platform !== "win32" &&
+    input.engineGroupDir !== undefined &&
+    child.pid !== undefined
+      ? trackEngineGroup(input.engineGroupDir, child.pid)
+      : undefined;
   const exited = new Promise<void>((resolve) => {
-    child.once("exit", () => resolve());
-    child.once("error", () => resolve());
+    child.once("exit", () => {
+      untrack?.();
+      resolve();
+    });
+    child.once("error", () => {
+      untrack?.();
+      resolve();
+    });
   });
   const kill = (): void => {
     if (child.pid === undefined) return;
@@ -99,6 +115,7 @@ export function stdioConnector(input: {
   command: string;
   args: string[];
   env?: Record<string, string>;
+  engineGroupDir?: string;
   spawn?: SpawnFn;
 }): AcpConnector {
   return async ({ cwd, onUpdate, onPermission, onClose }) => {
@@ -107,7 +124,12 @@ export function stdioConnector(input: {
       command: input.command,
       args: input.args,
       cwd,
-      env: { ...process.env, ...input.env },
+      env: {
+        ...process.env,
+        ...input.env,
+        SUNSET_HOST_PID: String(process.pid),
+      },
+      ...(input.engineGroupDir ? { engineGroupDir: input.engineGroupDir } : {}),
     });
     const stream = ndJsonStream(
       Writable.toWeb(proc.stdin) as WritableStream<Uint8Array>,

@@ -13,6 +13,8 @@ export {
 } from "./catalog.js";
 export { mapSessionUpdate, asAgentEvent } from "./map.js";
 export { stdioConnector, nodeSpawn } from "./client.js";
+export { reapOrphanedEngineGroups } from "./supervision.js";
+export type { EngineGroupMarker } from "./supervision.js";
 export type {
   AcpConnector,
   AcpConnectionHandle,

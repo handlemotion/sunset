@@ -158,6 +158,8 @@ export type CreateHostOptions = {
   stateDir: string;
   worktreeRoot: string;
   leaseTimeoutMs?: number;
+  engineIdleTtlMs?: number;
+  maxEnginesPerWorkspace?: number;
   git?: GitService;
   engines?: Partial<Record<EngineId, Engine>>;
   executionPolicy?: ExecutionPolicyInput;

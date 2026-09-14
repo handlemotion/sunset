@@ -4,6 +4,7 @@ import path from "node:path";
 import {
   createEngine,
   ENGINES,
+  reapOrphanedEngineGroups,
   type Engine,
   type EngineRun,
   type EngineSessionHandle,
@@ -56,6 +57,22 @@ function now(): number {
 }
 
 const DEFAULT_LEASE_TIMEOUT_MS = 5_000;
+const DEFAULT_ENGINE_IDLE_TTL_MS = 600_000;
+const DEFAULT_MAX_ENGINES_PER_WORKSPACE = 5;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+type EnginePoolEntry = {
+  sessionId: string;
+  workspaceId: string;
+  handle: EngineSessionHandle;
+  lastUsedAt: number;
+  idleTimer: NodeJS.Timeout | null;
+};
+
+type CapacityWaiter = {
+  resolve: () => void;
+  reject: (error: unknown) => void;
+};
 
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
@@ -105,6 +122,28 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
   if (!Number.isFinite(leaseTimeoutMs) || leaseTimeoutMs <= 0) {
     throw new HostError("leaseTimeoutMs must be positive", "invalid_options");
   }
+  const engineIdleTtlMs = options.engineIdleTtlMs ?? DEFAULT_ENGINE_IDLE_TTL_MS;
+  if (
+    !Number.isFinite(engineIdleTtlMs) ||
+    engineIdleTtlMs <= 0 ||
+    engineIdleTtlMs > MAX_TIMER_DELAY_MS
+  ) {
+    throw new HostError(
+      `engineIdleTtlMs must be between 1 and ${MAX_TIMER_DELAY_MS}`,
+      "invalid_options",
+    );
+  }
+  const maxEnginesPerWorkspace =
+    options.maxEnginesPerWorkspace ?? DEFAULT_MAX_ENGINES_PER_WORKSPACE;
+  if (
+    !Number.isInteger(maxEnginesPerWorkspace) ||
+    maxEnginesPerWorkspace <= 0
+  ) {
+    throw new HostError(
+      "maxEnginesPerWorkspace must be a positive integer",
+      "invalid_options",
+    );
+  }
   let defaultExecutionPolicy: ExecutionPolicy;
   try {
     defaultExecutionPolicy = resolveExecutionPolicy(options.executionPolicy);
@@ -118,6 +157,13 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
   const stateDir = await realpath(options.stateDir);
   const worktreeRoot = await realpath(options.worktreeRoot);
   const hostLease = await acquireHostLease(stateDir, leaseTimeoutMs);
+  const engineGroupDir = path.join(stateDir, "engine-groups");
+  try {
+    reapOrphanedEngineGroups(engineGroupDir);
+  } catch (error) {
+    await hostLease.release();
+    throw error;
+  }
   const sqlitePath = path.join(stateDir, "sunset.sqlite");
   let database: InstanceType<typeof Database>;
   try {
@@ -137,8 +183,10 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
   }
   const git: GitService = options.git ?? createGit();
   const engines: Record<EngineId, Engine> = {
-    devin: options.engines?.devin ?? createEngine(ENGINES.devin),
-    codex: options.engines?.codex ?? createEngine(ENGINES.codex),
+    devin:
+      options.engines?.devin ?? createEngine(ENGINES.devin, { engineGroupDir }),
+    codex:
+      options.engines?.codex ?? createEngine(ENGINES.codex, { engineGroupDir }),
   };
 
   const ENGINE_POLICY_CONTROLS: ExecutionPolicyControl[] = [
@@ -151,7 +199,12 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
   let suspending = false;
   let shutdownPromise: Promise<void> | undefined;
   const schedulers = new Map<string, Promise<void>>();
-  const sessionHandles = new Map<string, EngineSessionHandle>();
+  const enginePool = new Map<string, EnginePoolEntry>();
+  const engineClaims = new Map<string, number>();
+  const retiringEngineDisposals = new Map<string, Set<Promise<void>>>();
+  const pendingEngineCreations = new Set<Promise<unknown>>();
+  const capacityWaiters = new Map<string, CapacityWaiter[]>();
+  const capacityWaiterCancellers = new Map<string, () => void>();
   const activeRuns = new Map<string, EngineRun>();
   const activeRunControllers = new Map<string, AbortController>();
   const cancelRequested = new Set<string>();
@@ -352,21 +405,186 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
     });
   }
 
+  function signalEngineCapacity(workspaceId: string): void {
+    const waiters = capacityWaiters.get(workspaceId);
+    const head = waiters?.shift();
+    if (waiters && waiters.length === 0) capacityWaiters.delete(workspaceId);
+    head?.resolve();
+  }
+
+  function claimEngineCapacity(workspaceId: string): void {
+    engineClaims.set(workspaceId, (engineClaims.get(workspaceId) ?? 0) + 1);
+  }
+
+  function releaseEngineCapacity(workspaceId: string): void {
+    const count = (engineClaims.get(workspaceId) ?? 0) - 1;
+    if (count <= 0) engineClaims.delete(workspaceId);
+    else engineClaims.set(workspaceId, count);
+    signalEngineCapacity(workspaceId);
+  }
+
+  function liveEngineCount(workspaceId: string): number {
+    let count = engineClaims.get(workspaceId) ?? 0;
+    for (const entry of enginePool.values()) {
+      if (entry.workspaceId === workspaceId) count += 1;
+    }
+    count += retiringEngineDisposals.get(workspaceId)?.size ?? 0;
+    return count;
+  }
+
+  function markEngineIdle(sessionId: string): void {
+    const entry = enginePool.get(sessionId);
+    if (!entry || entry.idleTimer) return;
+    entry.lastUsedAt = now();
+    entry.idleTimer = setTimeout(() => {
+      entry.idleTimer = null;
+      void evictEngineEntry(entry);
+    }, engineIdleTtlMs);
+    entry.idleTimer.unref();
+    signalEngineCapacity(entry.workspaceId);
+  }
+
+  async function evictEngineEntry(entry: EnginePoolEntry): Promise<void> {
+    if (enginePool.get(entry.sessionId) !== entry) return;
+    // A session with queued or running work is busy and cannot be evicted.
+    if (schedulers.has(entry.sessionId)) return;
+    enginePool.delete(entry.sessionId);
+    if (entry.idleTimer) {
+      clearTimeout(entry.idleTimer);
+      entry.idleTimer = null;
+    }
+    const disposal = Promise.resolve()
+      .then(() => entry.handle.dispose())
+      .catch(() => undefined);
+    const trackedDisposal = disposal.finally(() => {
+      const disposals = retiringEngineDisposals.get(entry.workspaceId);
+      disposals?.delete(trackedDisposal);
+      if (disposals && disposals.size === 0) {
+        retiringEngineDisposals.delete(entry.workspaceId);
+      }
+      signalEngineCapacity(entry.workspaceId);
+    });
+    const disposals =
+      retiringEngineDisposals.get(entry.workspaceId) ??
+      new Set<Promise<void>>();
+    disposals.add(trackedDisposal);
+    retiringEngineDisposals.set(entry.workspaceId, disposals);
+    await trackedDisposal;
+  }
+
+  async function ensureEngineCapacity(
+    workspaceId: string,
+    runId?: string,
+  ): Promise<boolean> {
+    let queued = false;
+    for (;;) {
+      if (closing) {
+        throw new HostError("host is closed", "host_closed");
+      }
+      if (runId && cancelRequested.has(runId)) {
+        signalEngineCapacity(workspaceId);
+        return false;
+      }
+      const waiters = capacityWaiters.get(workspaceId);
+      if (!waiters?.length || queued) {
+        if (liveEngineCount(workspaceId) < maxEnginesPerWorkspace) {
+          claimEngineCapacity(workspaceId);
+          return true;
+        }
+        let lru: EnginePoolEntry | undefined;
+        for (const entry of enginePool.values()) {
+          if (entry.workspaceId !== workspaceId) continue;
+          if (schedulers.has(entry.sessionId)) continue;
+          if (!lru || entry.lastUsedAt < lru.lastUsedAt) lru = entry;
+        }
+        if (lru) {
+          claimEngineCapacity(workspaceId);
+          await evictEngineEntry(lru);
+          return true;
+        }
+      }
+      let cancelWaiter: (() => void) | undefined;
+      const wait = new Promise<void>((resolve, reject) => {
+        const waiter: CapacityWaiter = { resolve, reject };
+        const list = capacityWaiters.get(workspaceId) ?? [];
+        if (queued) list.unshift(waiter);
+        else list.push(waiter);
+        capacityWaiters.set(workspaceId, list);
+        if (runId) {
+          cancelWaiter = () => {
+            const current = capacityWaiters.get(workspaceId);
+            const index = current?.indexOf(waiter) ?? -1;
+            if (current && index >= 0) {
+              current.splice(index, 1);
+              if (current.length === 0) capacityWaiters.delete(workspaceId);
+            }
+            resolve();
+          };
+          capacityWaiterCancellers.set(runId, cancelWaiter);
+        }
+      });
+      try {
+        await wait;
+      } finally {
+        if (
+          runId &&
+          cancelWaiter &&
+          capacityWaiterCancellers.get(runId) === cancelWaiter
+        ) {
+          capacityWaiterCancellers.delete(runId);
+        }
+      }
+      if (runId && cancelRequested.has(runId)) return false;
+      queued = true;
+    }
+  }
+
+  function registerEngineEntry(
+    sessionId: string,
+    workspaceId: string,
+    handle: EngineSessionHandle,
+  ): void {
+    enginePool.set(sessionId, {
+      sessionId,
+      workspaceId,
+      handle,
+      lastUsedAt: now(),
+      idleTimer: null,
+    });
+  }
+
   async function sessionHandle(
     session: Session,
     workspace: Workspace,
-  ): Promise<EngineSessionHandle> {
-    const existing = sessionHandles.get(session.id);
-    if (existing) return existing;
-    const handle = await engineFor(session.engine).resume({
-      cwd: workspace.worktreePath,
-      model: session.model,
-      mode: session.mode,
-      executionPolicy: session.executionPolicy,
-      providerSessionId: session.providerSessionId,
-    });
-    sessionHandles.set(session.id, handle);
-    return handle;
+    runId?: string,
+  ): Promise<EngineSessionHandle | undefined> {
+    const existing = enginePool.get(session.id);
+    if (existing) {
+      existing.lastUsedAt = now();
+      if (existing.idleTimer) {
+        clearTimeout(existing.idleTimer);
+        existing.idleTimer = null;
+      }
+      return existing.handle;
+    }
+    if (!(await ensureEngineCapacity(workspace.id, runId))) return undefined;
+    try {
+      const handle = await engineFor(session.engine).resume({
+        cwd: workspace.worktreePath,
+        model: session.model,
+        mode: session.mode,
+        executionPolicy: session.executionPolicy,
+        providerSessionId: session.providerSessionId,
+      });
+      if (closing) {
+        await handle.dispose().catch(() => undefined);
+        throw new HostError("host is closed", "host_closed");
+      }
+      registerEngineEntry(session.id, workspace.id, handle);
+      return handle;
+    } finally {
+      releaseEngineCapacity(workspace.id);
+    }
   }
 
   function finishRun(runId: string, result: RunResult): void {
@@ -513,7 +731,23 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
           await availableModels(session.engine),
         );
       }
-      const handle = await sessionHandle(session, workspace);
+      const handle = await sessionHandle(session, workspace, stored.value.id);
+      if (!handle) {
+        cancelRequested.delete(stored.value.id);
+        finishRun(stored.value.id, {
+          runId: stored.value.id,
+          status: "cancelled",
+        });
+        return;
+      }
+      if (cancelRequested.has(stored.value.id)) {
+        cancelRequested.delete(stored.value.id);
+        finishRun(stored.value.id, {
+          runId: stored.value.id,
+          status: "cancelled",
+        });
+        return;
+      }
       const started = await handle.send(stored.prompt, {
         idempotencyKey: stored.value.id,
       });
@@ -523,7 +757,7 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
       }
       notifyRun(stored.value.id);
       await consumeRun(stored, started, workspace);
-      const latestHandle = sessionHandles.get(session.id);
+      const latestHandle = enginePool.get(session.id)?.handle;
       if (
         latestHandle &&
         latestHandle.providerSessionId !== session.providerSessionId
@@ -534,6 +768,11 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
         );
       }
     } catch (error) {
+      if (error instanceof HostError && error.code === "host_closed") {
+        // Shutdown interrupted dispatch before the prompt reached an engine;
+        // leave the run non-terminal so the next host retries it.
+        return;
+      }
       finishRun(
         stored.value.id,
         failure(
@@ -586,7 +825,9 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
         schedulers.delete(sessionId);
         if (!closing && state.getNextQueuedRun(sessionId)) {
           scheduleSession(sessionId);
+          return;
         }
+        markEngineIdle(sessionId);
       });
     schedulers.set(sessionId, task);
   }
@@ -611,6 +852,7 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
       return requireRun(runId).result ?? { runId, status: "cancelled" };
     }
     cancelRequested.add(runId);
+    capacityWaiterCancellers.get(runId)?.();
     await activeRuns
       .get(runId)
       ?.cancel()
@@ -947,6 +1189,11 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
     if (shutdownPromise) return shutdownPromise;
     closing = true;
     suspending = mode === "suspend";
+    const shutdownError = new HostError("host is closed", "host_closed");
+    for (const waiters of capacityWaiters.values()) {
+      for (const waiter of waiters) waiter.reject(shutdownError);
+    }
+    capacityWaiters.clear();
     shutdownPromise = (async () => {
       try {
         if (suspending) {
@@ -970,12 +1217,20 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
             ),
           );
         }
+        await Promise.allSettled([...pendingEngineCreations]);
         await Promise.all([...schedulers.values()]);
         await Promise.all(
-          [...sessionHandles.values()].map((handle) =>
-            handle.dispose().catch(() => undefined),
-          ),
+          [...enginePool.values()].map((entry) => {
+            return evictEngineEntry(entry);
+          }),
         );
+        enginePool.clear();
+        await Promise.all(
+          [...retiringEngineDisposals.values()].flatMap((disposals) => [
+            ...disposals,
+          ]),
+        );
+        engineClaims.clear();
       } finally {
         for (const runId of runWaiters.keys()) notifyRun(runId);
         try {
@@ -1253,37 +1508,50 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
           input.executionPolicy,
           defaultExecutionPolicy,
         );
-        const handle = await engineFor(engine).create({
-          cwd: workspace.worktreePath,
-          model,
-          mode,
-          executionPolicy,
-        });
-        assertOpen();
-        const session: Session = {
-          id: ulid(),
-          workspaceId: workspace.id,
-          engine,
-          location,
-          providerSessionId: handle.providerSessionId,
-          mode,
-          model,
-          executionPolicy,
-          createdAt: now(),
-        };
-        const run: Run = {
-          id: ulid(),
-          sessionId: session.id,
-          status: "queued",
-          createdAt: now(),
-          startedAt: null,
-          finishedAt: null,
-        };
-        state.insertSessionAndRun(session, run, input.prompt);
-        catalogValidatedRuns.add(run.id);
-        sessionHandles.set(session.id, handle);
-        scheduleSession(session.id);
-        return { session, run };
+        await ensureEngineCapacity(workspace.id);
+        const creation = (async () => {
+          const handle = await engineFor(engine).create({
+            cwd: workspace.worktreePath,
+            model,
+            mode,
+            executionPolicy,
+          });
+          if (closing) {
+            await handle.dispose().catch(() => undefined);
+            throw new HostError("host is closed", "host_closed");
+          }
+          const session: Session = {
+            id: ulid(),
+            workspaceId: workspace.id,
+            engine,
+            location,
+            providerSessionId: handle.providerSessionId,
+            mode,
+            model,
+            executionPolicy,
+            createdAt: now(),
+          };
+          const run: Run = {
+            id: ulid(),
+            sessionId: session.id,
+            status: "queued",
+            createdAt: now(),
+            startedAt: null,
+            finishedAt: null,
+          };
+          state.insertSessionAndRun(session, run, input.prompt);
+          catalogValidatedRuns.add(run.id);
+          registerEngineEntry(session.id, workspace.id, handle);
+          scheduleSession(session.id);
+          return { session, run };
+        })();
+        pendingEngineCreations.add(creation);
+        try {
+          return await creation;
+        } finally {
+          pendingEngineCreations.delete(creation);
+          releaseEngineCapacity(workspace.id);
+        }
       },
       async send(input) {
         assertOpen();
