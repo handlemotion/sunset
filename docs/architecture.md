@@ -38,8 +38,8 @@ browser (apps/web)
 - **CLI** — [packages/cli](../packages/cli): `sunset serve`/`open` start the
   host + server and print the tokenized URL; `projects`, `workspaces`, and
   `capabilities` subcommands talk to the host directly. State defaults to
-  `~/.local/share/sunset` (`SUNSET_STATE_DIR`, `--state-dir`,
-  `--worktree-root`).
+  `~/.local/share/sunset/state`; `SUNSET_STATE_DIR` changes the root, while
+  `--state-dir` and `--worktree-root` set the database and worktree locations.
 
 ## Dormant cloud boundary
 

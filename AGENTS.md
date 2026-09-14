@@ -41,6 +41,9 @@ pnpm format:check   # prettier --check
 pnpm check          # format:check + check-types + test + build
 ```
 
+`pnpm lint` is defined at the root, but no workspace package currently defines
+a `lint` task, so Turbo has no lint work to run.
+
 Per-package scripts: every code package has `build` and `check-types`
 (`@sunset/typescript-config` ships only shared tsconfig files, no scripts);
 packages with tests use `test` → `vitest run` (`--passWithNoTests` where no
