@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
+import Database from "better-sqlite3";
 import { execa } from "execa";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -20,6 +21,7 @@ import type {
 
 import { createHost } from "./create-host.js";
 import { HostError } from "./errors.js";
+import type { HostEvent } from "./types.js";
 
 const temps: string[] = [];
 
@@ -33,6 +35,26 @@ async function tempDir(name: string): Promise<string> {
   const dir = await mkdtemp(path.join(tmpdir(), `sunset-host-${name}-`));
   temps.push(dir);
   return realpath(dir);
+}
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("timed out waiting for condition");
+}
+
+function setEnv(name: string, value: string): () => void {
+  const prior = process.env[name];
+  process.env[name] = value;
+  return () => {
+    if (prior === undefined) {
+      delete process.env[name];
+    } else {
+      process.env[name] = prior;
+    }
+  };
 }
 
 async function initRepo(): Promise<string> {
@@ -401,5 +423,178 @@ describe("createHost", () => {
       expect((error as HostError).code).toBe("unknown_session");
     }
     await host.close();
+  });
+
+  it("prunes events for runs finished beyond the retention window on startup", async () => {
+    const root = await tempDir("state");
+    const stateDir = path.join(root, "state");
+    const worktreeRoot = path.join(root, "worktrees");
+    const first = fakeEngine([
+      { events: [{ type: "text_delta", text: "old" }] },
+      { events: [{ type: "text_delta", text: "recent" }] },
+    ]);
+    const host = await createHost({
+      stateDir,
+      worktreeRoot,
+      engines: { devin: first.engine },
+    });
+    const repo = await initRepo();
+    const project = await host.projects.register(repo);
+    const workspace = await host.workspaces.create({
+      projectId: project.id,
+      slug: "retention",
+    });
+    const { session, run: oldRun } = await host.sessions.create({
+      workspaceId: workspace.id,
+      prompt: "first",
+    });
+    const recent = await host.sessions.send({
+      sessionId: session.id,
+      prompt: "second",
+    });
+    await host.runs.wait({ runId: oldRun.id });
+    await host.runs.wait({ runId: recent.run.id });
+    await host.close();
+
+    const database = new Database(path.join(stateDir, "sunset.sqlite"));
+    try {
+      database
+        .prepare("UPDATE runs SET finished_at = ? WHERE id = ?")
+        .run(Date.now() - 31 * 24 * 60 * 60 * 1_000, oldRun.id);
+    } finally {
+      database.close();
+    }
+
+    const host2 = await createHost({
+      stateDir,
+      worktreeRoot,
+      engines: { devin: fakeEngine().engine },
+    });
+    const oldEvents: HostEvent[] = [];
+    for await (const event of host2.runs.attach({ runId: oldRun.id })) {
+      oldEvents.push(event);
+    }
+    expect(oldEvents).toHaveLength(0);
+    const recentEvents: HostEvent[] = [];
+    for await (const event of host2.runs.attach({ runId: recent.run.id })) {
+      recentEvents.push(event);
+    }
+    expect(recentEvents.map((event) => event.type)).toEqual(["text_delta"]);
+    await host2.close();
+  });
+
+  it("caps persisted run events and records an events_truncated marker", async () => {
+    const restoreMaxEvents = setEnv("SUNSET_MAX_EVENTS_PER_RUN", "3");
+    try {
+      const root = await tempDir("state");
+      const { engine } = fakeEngine([
+        {
+          events: [
+            { type: "text_delta", text: "a" },
+            { type: "text_delta", text: "b" },
+            { type: "text_delta", text: "c" },
+            { type: "text_delta", text: "d" },
+            { type: "text_delta", text: "e" },
+          ],
+        },
+      ]);
+      const host = await createHost({
+        stateDir: path.join(root, "state"),
+        worktreeRoot: path.join(root, "worktrees"),
+        engines: { devin: engine },
+      });
+      const repo = await initRepo();
+      const project = await host.projects.register(repo);
+      const workspace = await host.workspaces.create({
+        projectId: project.id,
+        slug: "capped",
+      });
+      const { run } = await host.sessions.create({
+        workspaceId: workspace.id,
+        prompt: "hi",
+      });
+      const result = await host.runs.wait({ runId: run.id });
+      expect(result.status).toBe("finished");
+
+      const events: HostEvent[] = [];
+      for await (const event of host.runs.attach({ runId: run.id })) {
+        events.push(event);
+      }
+      expect(events).toHaveLength(3);
+      expect(events.map((event) => event.sequence)).toEqual([1, 2, 4]);
+      expect(events.slice(0, 2).map((event) => event.type)).toEqual([
+        "text_delta",
+        "text_delta",
+      ]);
+      expect(events[2]).toMatchObject({
+        type: "status",
+        status: "events_truncated",
+      });
+      await host.close();
+    } finally {
+      restoreMaxEvents();
+    }
+  });
+
+  it("live-tails events through attach while a run is in flight", async () => {
+    const root = await tempDir("state");
+    const { engine } = fakeEngine([
+      { events: [{ type: "text_delta", text: "live" }], hang: true },
+    ]);
+    const host = await createHost({
+      stateDir: path.join(root, "state"),
+      worktreeRoot: path.join(root, "worktrees"),
+      engines: { devin: engine },
+    });
+    const repo = await initRepo();
+    const project = await host.projects.register(repo);
+    const workspace = await host.workspaces.create({
+      projectId: project.id,
+      slug: "live",
+    });
+    const { run } = await host.sessions.create({
+      workspaceId: workspace.id,
+      prompt: "go",
+    });
+
+    const collected: HostEvent[] = [];
+    const attached = (async () => {
+      for await (const event of host.runs.attach({ runId: run.id })) {
+        collected.push(event);
+      }
+    })();
+    await waitFor(() => collected.length === 1);
+    expect(collected[0]).toMatchObject({ type: "text_delta", sequence: 1 });
+
+    const result = await host.runs.cancel({ runId: run.id });
+    expect(result.status).toBe("cancelled");
+    await attached;
+    await host.close();
+  });
+
+  it("rejects malformed retention environment configuration", async () => {
+    const root = await tempDir("state");
+    const restoreMaxEvents = setEnv("SUNSET_MAX_EVENTS_PER_RUN", "abc");
+    try {
+      await expect(
+        createHost({
+          stateDir: path.join(root, "state"),
+          worktreeRoot: path.join(root, "worktrees"),
+        }),
+      ).rejects.toMatchObject({ code: "invalid_options" });
+    } finally {
+      restoreMaxEvents();
+    }
+    const restoreRetention = setEnv("SUNSET_EVENT_RETENTION_DAYS", "-1");
+    try {
+      await expect(
+        createHost({
+          stateDir: path.join(root, "state"),
+          worktreeRoot: path.join(root, "worktrees"),
+        }),
+      ).rejects.toMatchObject({ code: "invalid_options" });
+    } finally {
+      restoreRetention();
+    }
   });
 });

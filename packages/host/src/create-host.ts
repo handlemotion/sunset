@@ -74,6 +74,40 @@ type CapacityWaiter = {
   reject: (error: unknown) => void;
 };
 
+const DEFAULT_EVENT_RETENTION_DAYS = 30;
+const DEFAULT_MAX_EVENTS_PER_RUN = 10_000;
+const DAY_MS = 24 * 60 * 60 * 1_000;
+
+function eventRetentionDays(): number {
+  const raw = process.env.SUNSET_EVENT_RETENTION_DAYS;
+  if (raw === undefined || raw.trim() === "") {
+    return DEFAULT_EVENT_RETENTION_DAYS;
+  }
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) {
+    throw new HostError(
+      "SUNSET_EVENT_RETENTION_DAYS must be a non-negative number",
+      "invalid_options",
+    );
+  }
+  return value;
+}
+
+function maxEventsPerRun(): number {
+  const raw = process.env.SUNSET_MAX_EVENTS_PER_RUN;
+  if (raw === undefined || raw.trim() === "") {
+    return DEFAULT_MAX_EVENTS_PER_RUN;
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new HostError(
+      "SUNSET_MAX_EVENTS_PER_RUN must be a positive integer",
+      "invalid_options",
+    );
+  }
+  return value;
+}
+
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === "string") return error;
@@ -144,6 +178,8 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
       "invalid_options",
     );
   }
+  const eventRetentionMs = eventRetentionDays() * DAY_MS;
+  const maxRunEvents = maxEventsPerRun();
   let defaultExecutionPolicy: ExecutionPolicy;
   try {
     defaultExecutionPolicy = resolveExecutionPolicy(options.executionPolicy);
@@ -176,6 +212,7 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
   try {
     migrate(database);
     state = createState(database);
+    state.pruneRunEvents(now() - eventRetentionMs);
   } catch (error) {
     database.close();
     await hostLease.release();
@@ -213,6 +250,7 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
   const runWaiters = new Map<string, Set<() => void>>();
   const catalogValidatedRuns = new Set<string>();
   let catalogRequest: Promise<HostCapabilities> | undefined;
+  let retentionTimer: ReturnType<typeof setInterval> | undefined;
 
   function assertOpen(): void {
     if (closing || closed) {
@@ -658,9 +696,30 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
     }
 
     let sequence = 0;
+    let eventsTruncated = false;
     try {
       for await (const event of run.stream({ signal: controller.signal })) {
         sequence += 1;
+        if (eventsTruncated) continue;
+        if (sequence > maxRunEvents) {
+          eventsTruncated = true;
+          const marker: HostEvent = {
+            type: "status",
+            status: "events_truncated",
+            workspaceId: workspace.id,
+            sessionId: stored.value.sessionId,
+            runId: stored.value.id,
+            sequence,
+          };
+          state.replaceLatestRunEvent(
+            stored.value.id,
+            sequence,
+            serializeEvent(marker),
+            now(),
+          );
+          notifyRun(stored.value.id);
+          continue;
+        }
         const annotated = {
           ...event,
           workspaceId: workspace.id,
@@ -1185,6 +1244,15 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
     }
   }
 
+  function sweepRunEventRetention(): void {
+    if (closing || closed) return;
+    try {
+      state.pruneRunEvents(now() - eventRetentionMs);
+    } catch {
+      // A failed sweep must not take the host down; the next interval retries.
+    }
+  }
+
   function shutdown(mode: "close" | "suspend"): Promise<void> {
     if (shutdownPromise) return shutdownPromise;
     closing = true;
@@ -1194,6 +1262,10 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
       for (const waiter of waiters) waiter.reject(shutdownError);
     }
     capacityWaiters.clear();
+    if (retentionTimer !== undefined) {
+      clearInterval(retentionTimer);
+      retentionTimer = undefined;
+    }
     shutdownPromise = (async () => {
       try {
         if (suspending) {
@@ -1666,6 +1738,9 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
   for (const run of state.listNonterminalRuns()) {
     scheduleSession(run.value.sessionId);
   }
+
+  retentionTimer = setInterval(sweepRunEventRetention, DAY_MS);
+  retentionTimer.unref();
 
   return host;
 }
