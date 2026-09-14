@@ -5,7 +5,7 @@ import type { Host, HostEvent } from "@sunset/host";
 
 import { createSunsetServer } from "./server.js";
 
-function stubHost(): Host {
+function stubHost(options: { hangAttach?: boolean } = {}): Host {
   const project = { id: "p1", repoRoot: "/tmp/repo" };
   const workspace = {
     id: "w1",
@@ -119,7 +119,20 @@ function stubHost(): Host {
       async cancel() {
         return { runId: "r1", status: "cancelled" as const };
       },
-      attach({ afterSequence }) {
+      attach({ afterSequence, signal }) {
+        if (options.hangAttach) {
+          return {
+            async *[Symbol.asyncIterator]() {
+              await new Promise<void>((resolve) => {
+                if (signal?.aborted) {
+                  resolve();
+                  return;
+                }
+                signal?.addEventListener("abort", () => resolve());
+              });
+            },
+          };
+        }
         const events: HostEvent[] = [
           {
             type: "text_delta",
@@ -226,5 +239,76 @@ describe("createSunsetServer", () => {
       }),
     ).rejects.toThrow();
     await server.close();
+  });
+
+  it("rejects WebSocket upgrades from a foreign Origin", async () => {
+    const server = await createSunsetServer({ host: stubHost() });
+    await expect(
+      new Promise((resolve, reject) => {
+        const ws = new WebSocket(
+          `${server.url.replace("http", "ws")}/api/runs/r1/events?token=${server.token}`,
+          { headers: { origin: "https://evil.example.com" } },
+        );
+        ws.on("open", () => resolve(undefined));
+        ws.on("error", (error) => reject(error));
+      }),
+    ).rejects.toThrow("403");
+    await server.close();
+  });
+
+  it("accepts WebSocket upgrades from a localhost Origin", async () => {
+    const server = await createSunsetServer({ host: stubHost() });
+    const ws = new WebSocket(
+      `${server.url.replace("http", "ws")}/api/runs/r1/events?token=${server.token}`,
+      { headers: { origin: "http://localhost:5173" } },
+    );
+    const received: unknown[] = [];
+    await new Promise<void>((resolve, reject) => {
+      ws.on("message", (data) => received.push(JSON.parse(String(data))));
+      ws.on("close", () => resolve());
+      ws.on("error", reject);
+      setTimeout(() => reject(new Error("ws timeout")), 5000);
+    });
+    expect(received).toHaveLength(2);
+    await server.close();
+  });
+
+  it("returns 413 for JSON request bodies larger than 1 MiB", async () => {
+    const server = await createSunsetServer({ host: stubHost() });
+    const oversized = await fetch(`${server.url}/api/projects`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${server.token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ repoRoot: "/tmp/", pad: "x".repeat(1024 * 1024) }),
+    });
+    expect(oversized.status).toBe(413);
+
+    const ok = await fetch(`${server.url}/api/projects`, {
+      headers: { authorization: `Bearer ${server.token}` },
+    });
+    expect(ok.status).toBe(200);
+    await server.close();
+  });
+
+  it("closes open WebSockets when the server closes", async () => {
+    const server = await createSunsetServer({
+      host: stubHost({ hangAttach: true }),
+    });
+    const ws = new WebSocket(
+      `${server.url.replace("http", "ws")}/api/runs/r1/events?token=${server.token}`,
+    );
+    const closed = new Promise<void>((resolve) =>
+      ws.on("close", () => resolve()),
+    );
+    await new Promise<void>((resolve, reject) => {
+      ws.on("open", () => resolve());
+      ws.on("error", reject);
+      setTimeout(() => reject(new Error("ws timeout")), 5000);
+    });
+    await server.close();
+    await closed;
+    expect(ws.readyState).toBe(WebSocket.CLOSED);
   });
 });
