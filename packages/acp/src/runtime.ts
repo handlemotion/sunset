@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import type {
   AgentMode,
+  ExecutionPolicy,
   ModelCapability,
   ModelSelection,
 } from "@sunset/domain";
@@ -9,6 +10,7 @@ import { resolveExecutionPolicy } from "@sunset/domain";
 import type {
   RequestPermissionRequest,
   RequestPermissionResponse,
+  SessionConfigOption,
   SessionModeState,
   SessionUpdate,
 } from "@agentclientprotocol/sdk";
@@ -158,9 +160,14 @@ class AgentEventQueue {
 class AcpSession implements EngineSessionHandle {
   providerSessionId = "";
   conn!: AcpConnectionHandle;
+  /** Set by the connector's onClose; gates session/prompt retries. */
+  closed = false;
   private active: AgentEventQueue | null = null;
 
-  constructor(private readonly cwd: string) {}
+  constructor(
+    private readonly cwd: string,
+    private readonly retryPrompts: boolean,
+  ) {}
 
   handleUpdate(sessionId: string, update: SessionUpdate): void {
     if (sessionId !== this.providerSessionId) return;
@@ -172,19 +179,30 @@ class AcpSession implements EngineSessionHandle {
     const runId = randomUUID();
     const queue = new AgentEventQueue();
     this.active = queue;
-    const promptPromise = this.conn
-      .request("session/prompt", {
-        sessionId: this.providerSessionId,
-        prompt: [{ type: "text", text: prompt }],
-      })
-      .then((response) => {
-        const usage = promptUsage(response);
-        if (usage) queue.push({ type: "usage", ...usage });
-        return response;
-      })
-      .finally(() => queue.finish());
     const conn = this.conn;
     const providerSessionId = this.providerSessionId;
+    const turn = { cancelled: false };
+    const promptOnce = () =>
+      conn
+        .request("session/prompt", {
+          sessionId: providerSessionId,
+          prompt: [{ type: "text", text: prompt }],
+        })
+        .then((response) => {
+          const usage = promptUsage(response);
+          if (usage) queue.push({ type: "usage", ...usage });
+          return response;
+        });
+    // agentRetries: one same-session retry of a rejected session/prompt while
+    // the agent connection is still live. A cancelled turn — resolved with
+    // stopReason "cancelled" or rejected after run.cancel() — never retries,
+    // and neither do control-plane requests.
+    const promptPromise = promptOnce()
+      .catch((error: unknown) => {
+        if (turn.cancelled || this.closed || !this.retryPrompts) throw error;
+        return promptOnce();
+      })
+      .finally(() => queue.finish());
     const run: EngineRun = {
       runId,
       stream: (options) => queue.drain(options?.signal),
@@ -208,6 +226,7 @@ class AcpSession implements EngineSessionHandle {
         }
       },
       async cancel() {
+        turn.cancelled = true;
         await conn
           .notify("session/cancel", { sessionId: providerSessionId })
           .catch(() => undefined);
@@ -287,13 +306,13 @@ async function applyMode(
   sessionId: string,
   mode: AgentMode | undefined,
   modes: SessionModeState | null,
-): Promise<void> {
-  if (!mode || mode === "agent") return;
+): Promise<boolean> {
+  if (!mode || mode === "agent") return false;
   const available = modes?.availableModes?.map((entry) => entry.id) ?? [];
   const target = PLAN_MODE_CANDIDATES.find((candidate) =>
     available.includes(candidate),
   );
-  if (!target) return;
+  if (!target) return false;
   try {
     await controlRequest(conn, "session/set_mode", {
       sessionId,
@@ -303,7 +322,123 @@ async function applyMode(
     // set_mode is best-effort, but a timeout already closed the connection —
     // the session must not come back looking usable.
     if (isTimeoutError(error)) throw error;
+    return false;
   }
+  return true;
+}
+
+/**
+ * The mode/config surfaces a session response advertises. `session/new`,
+ * `session/resume`, and `session/load` all carry `modes` and
+ * `configOptions`.
+ */
+type SessionSurface = {
+  modes?: SessionModeState | null;
+  configOptions?: SessionConfigOption[] | null;
+};
+
+/** Codex's select config option carrying the session mode. */
+const MODE_CONFIG_ID = "mode";
+
+/**
+ * ExecutionPolicy → engine mode, strictest-first: `sandbox.enabled` maps to
+ * `read-only`; otherwise `autoReview` maps to `agent`; otherwise
+ * `agent-full-access`. Sandbox wins over autoReview because a sandboxed run
+ * must never inherit the unsandboxed tier just because review automation was
+ * requested. These ids are the codex-acp 1.11.0 mode surface: `read-only` is
+ * on-request approvals under a workspace-write sandbox with no writable
+ * roots, `agent` is the default auto-review/workspace-write tier, and
+ * `agent-full-access` drops approvals entirely (danger-full-access).
+ */
+function policyModeId(policy: ExecutionPolicy): string {
+  if (policy.sandbox.enabled) return "read-only";
+  if (policy.autoReview) return "agent";
+  return "agent-full-access";
+}
+
+/** Advertised value ids of a `select` config option, flattening groups. */
+function selectOptionValues(option: SessionConfigOption): string[] {
+  if (option.type !== "select") return [];
+  const values: string[] = [];
+  for (const entry of option.options) {
+    if ("value" in entry) values.push(entry.value);
+    else for (const grouped of entry.options) values.push(grouped.value);
+  }
+  return values;
+}
+
+/**
+ * Apply the execution policy's mode to a created or resumed session.
+ *
+ * An explicit `mode: "plan"` request keeps its existing behavior first; the
+ * policy mode is only consulted when no plan-capable mode was advertised,
+ * and then clamped to at most `agent` so an unhonored plan request can never
+ * land the session in `agent-full-access`.
+ *
+ * The codex adapter (codex-acp 1.11.0) advertises a `select` config option
+ * id "mode" over `read-only`/`agent`/`agent-full-access`; it is applied via
+ * `session/set_config_option` only when that option and the desired value
+ * are both advertised. Adapters without the config option, or adapters that
+ * reject the write, fall back to `session/set_mode` when the target mode id
+ * is advertised. Absent, unknown, or non-select options are skipped; no
+ * `_meta` keys are guessed.
+ *
+ * When the target is advertised but every surface rejects it, the session
+ * fails closed — the connection is closed and creation throws rather than
+ * silently running at the adapter's weaker default. When no surface
+ * advertises the target at all, application is skipped silently so
+ * adapters without the control keep working best-effort.
+ */
+async function applySessionMode(
+  conn: AcpConnectionHandle,
+  sessionId: string,
+  requested: AgentMode | undefined,
+  policy: ExecutionPolicy,
+  surface: SessionSurface,
+): Promise<void> {
+  let target = policyModeId(policy);
+  if (requested === "plan") {
+    if (await applyMode(conn, sessionId, requested, surface.modes ?? null)) {
+      return;
+    }
+    // An unhonored plan request must not end up in agent-full-access.
+    if (target === "agent-full-access") target = "agent";
+  }
+  const option = surface.configOptions?.find(
+    (entry) => entry.id === MODE_CONFIG_ID && entry.type === "select",
+  );
+  const configId =
+    option && selectOptionValues(option).includes(target) ? option.id : null;
+  const viaModes =
+    surface.modes?.availableModes?.some((entry) => entry.id === target) ??
+    false;
+  if (configId === null && !viaModes) return;
+  if (configId !== null) {
+    try {
+      await controlRequest(conn, "session/set_config_option", {
+        sessionId,
+        configId,
+        value: target,
+      });
+      return;
+    } catch (error) {
+      if (isTimeoutError(error)) throw error;
+      // Rejected write: fall through to the advertised set_mode surface.
+    }
+  }
+  if (viaModes) {
+    try {
+      await controlRequest(conn, "session/set_mode", {
+        sessionId,
+        modeId: target,
+      });
+      return;
+    } catch (error) {
+      if (isTimeoutError(error)) throw error;
+    }
+  }
+  conn.close();
+  throw new Error(`policy_mode_unapplied:${target}`);
 }
 
 export function createEngine(
@@ -341,7 +476,9 @@ export function createEngine(
         }
         return pickPermission(params);
       },
-      onClose: () => undefined,
+      onClose: () => {
+        session.closed = true;
+      },
     });
   }
 
@@ -351,7 +488,8 @@ export function createEngine(
   ): Promise<EngineSessionHandle> {
     // The connector needs a session reference for update routing; conn is
     // assigned before any agent traffic can arrive.
-    const session = new AcpSession(input.cwd);
+    const policy = resolveExecutionPolicy(input.executionPolicy);
+    const session = new AcpSession(input.cwd, policy.agentRetries);
     const conn = await connectorFor(input, session);
     session.conn = conn;
 
@@ -392,53 +530,23 @@ export function createEngine(
         conn.close();
         throw new Error("session_resume_unsupported");
       }
-      try {
-        await controlRequest(conn, "session/resume", {
+      // Resume ladder: session/resume, one re-auth retry, then session/load
+      // with the same retry. The winning response supplies the mode/config
+      // surface the execution policy is applied against below.
+      const attach = (method: "session/resume" | "session/load") =>
+        controlRequest(conn, method, {
           sessionId: providerSessionId,
           cwd: input.cwd,
           mcpServers: [],
-        });
-      } catch (resumeError) {
-        if (isAuthError(resumeError)) {
-          await authenticate();
-          try {
-            await controlRequest(conn, "session/resume", {
-              sessionId: providerSessionId,
-              cwd: input.cwd,
-              mcpServers: [],
-            });
-            if (definition.modelViaSetModel) {
-              await applyModel(conn, providerSessionId, input.model);
-            }
-            return session;
-          } catch (retryError) {
-            if (isTimeoutError(retryError)) throw retryError;
-            // fall through to session/load
-          }
-        }
-        if (isTimeoutError(resumeError)) throw resumeError;
+        }) as Promise<SessionSurface>;
+      const loadSession = async (): Promise<SessionSurface> => {
         try {
-          await controlRequest(conn, "session/load", {
-            sessionId: providerSessionId,
-            cwd: input.cwd,
-            mcpServers: [],
-          });
-          if (definition.modelViaSetModel) {
-            await applyModel(conn, providerSessionId, input.model);
-          }
+          return await attach("session/load");
         } catch (error) {
           if (isAuthError(error)) {
             await authenticate();
             try {
-              await controlRequest(conn, "session/load", {
-                sessionId: providerSessionId,
-                cwd: input.cwd,
-                mcpServers: [],
-              });
-              if (definition.modelViaSetModel) {
-                await applyModel(conn, providerSessionId, input.model);
-              }
-              return session;
+              return await attach("session/load");
             } catch (retry) {
               if (isTimeoutError(retry)) throw retry;
               conn.close();
@@ -453,19 +561,44 @@ export function createEngine(
             `session_resume_failed:${error instanceof Error ? error.message : "unknown"}`,
           );
         }
+      };
+      let attached: SessionSurface;
+      try {
+        attached = await attach("session/resume");
+      } catch (resumeError) {
+        if (isAuthError(resumeError)) {
+          await authenticate();
+          try {
+            attached = await attach("session/resume");
+          } catch (retryError) {
+            if (isTimeoutError(retryError)) throw retryError;
+            // fall through to session/load
+            attached = await loadSession();
+          }
+        } else {
+          if (isTimeoutError(resumeError)) throw resumeError;
+          attached = await loadSession();
+        }
       }
       if (definition.modelViaSetModel) {
         await applyModel(conn, providerSessionId, input.model);
       }
+      await applySessionMode(
+        conn,
+        providerSessionId,
+        input.mode,
+        policy,
+        attached,
+      );
       return session;
     }
 
-    let created: { sessionId: string; modes?: SessionModeState };
+    let created: { sessionId: string } & SessionSurface;
     try {
       created = (await controlRequest(conn, "session/new", {
         cwd: input.cwd,
         mcpServers: [],
-      })) as { sessionId: string; modes?: SessionModeState };
+      })) as { sessionId: string } & SessionSurface;
     } catch (error) {
       if (!isAuthError(error)) throw error;
       // Engines like `devin acp` keep credentials per-process: authenticate
@@ -474,13 +607,19 @@ export function createEngine(
       created = (await controlRequest(conn, "session/new", {
         cwd: input.cwd,
         mcpServers: [],
-      })) as { sessionId: string; modes?: SessionModeState };
+      })) as { sessionId: string } & SessionSurface;
     }
     session.providerSessionId = created.sessionId;
     if (definition.modelViaSetModel) {
       await applyModel(conn, created.sessionId, input.model);
     }
-    await applyMode(conn, created.sessionId, input.mode, created.modes ?? null);
+    await applySessionMode(
+      conn,
+      created.sessionId,
+      input.mode,
+      policy,
+      created,
+    );
     return session;
   }
 

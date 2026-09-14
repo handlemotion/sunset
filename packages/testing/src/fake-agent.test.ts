@@ -90,13 +90,17 @@ describe("fakeAcpAgent over createEngine", () => {
     expect(result.status).toBe("finished");
     expect(result.result).toBe("hello world");
     // usage_update, session_info_update and available_commands_update are
-    // delivered to the client but map to no domain events.
+    // delivered to the client and map to usage, session_title and commands
+    // events.
     expect(events.map((event) => event.type)).toEqual([
       "thought_delta",
       "text_delta",
       "tool_call",
       "tool_result",
       "plan",
+      "usage",
+      "session_title",
+      "commands",
       "text_delta",
     ]);
     await session.dispose();

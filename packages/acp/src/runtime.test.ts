@@ -64,7 +64,7 @@ function inProcessConnector(
   build: () => AgentApp,
   onClose?: () => void,
 ): AcpConnector {
-  return async ({ onUpdate, onPermission }) => {
+  return async ({ onUpdate, onPermission, onClose: notifyClose }) => {
     const app = acpClient({ name: "sunset-test" });
     app.onNotification("session/update", (ctx) => {
       const params = ctx.params as {
@@ -77,14 +77,20 @@ function inProcessConnector(
       onPermission(ctx.params as Parameters<typeof onPermission>[0]),
     );
     const conn = app.connect(build());
-    void conn.closed.catch(() => undefined);
+    conn.closed.then(
+      () => {
+        onClose?.();
+        notifyClose(null);
+      },
+      (error) => {
+        onClose?.();
+        notifyClose(error);
+      },
+    );
     return {
       request: conn.agent.request.bind(conn.agent),
       notify: conn.agent.notify.bind(conn.agent),
-      close: () => {
-        onClose?.();
-        conn.close();
-      },
+      close: () => conn.close(),
     };
   };
 }
