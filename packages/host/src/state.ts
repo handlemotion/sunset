@@ -283,6 +283,9 @@ export function createState(database: SqliteDatabase) {
     insertRunEvent: database.prepare(
       "INSERT INTO run_events (run_id, sequence, event_json, created_at) VALUES (?, ?, ?, ?)",
     ),
+    deleteLatestRunEvent: database.prepare(
+      "DELETE FROM run_events WHERE run_id = ? AND sequence = (SELECT MAX(sequence) FROM run_events WHERE run_id = ?)",
+    ),
     pruneRunEvents: database.prepare(
       `DELETE FROM run_events WHERE run_id IN (
         SELECT id FROM runs
@@ -361,6 +364,16 @@ export function createState(database: SqliteDatabase) {
         prompt,
         runValue.createdAt,
       );
+    },
+  );
+
+  const replaceLatestRunEvent = database.transaction(
+    (runId: string, sequence: number, eventJson: string, createdAt: number) => {
+      const result = statements.deleteLatestRunEvent.run(runId, runId);
+      if (result.changes !== 1) {
+        throw new Error("cannot replace missing run event");
+      }
+      statements.insertRunEvent.run(runId, sequence, eventJson, createdAt);
     },
   );
 
@@ -573,6 +586,14 @@ export function createState(database: SqliteDatabase) {
       createdAt: number,
     ): void {
       statements.insertRunEvent.run(runId, sequence, eventJson, createdAt);
+    },
+    replaceLatestRunEvent(
+      runId: string,
+      sequence: number,
+      eventJson: string,
+      createdAt: number,
+    ): void {
+      replaceLatestRunEvent(runId, sequence, eventJson, createdAt);
     },
     pruneRunEvents(finishedBefore: number): number {
       return statements.pruneRunEvents.run(finishedBefore).changes;

@@ -711,7 +711,7 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
             runId: stored.value.id,
             sequence,
           };
-          state.insertRunEvent(
+          state.replaceLatestRunEvent(
             stored.value.id,
             sequence,
             serializeEvent(marker),

@@ -520,13 +520,13 @@ describe("createHost", () => {
       for await (const event of host.runs.attach({ runId: run.id })) {
         events.push(event);
       }
-      expect(events.map((event) => event.sequence)).toEqual([1, 2, 3, 4]);
-      expect(events.slice(0, 3).map((event) => event.type)).toEqual([
-        "text_delta",
+      expect(events).toHaveLength(3);
+      expect(events.map((event) => event.sequence)).toEqual([1, 2, 4]);
+      expect(events.slice(0, 2).map((event) => event.type)).toEqual([
         "text_delta",
         "text_delta",
       ]);
-      expect(events[3]).toMatchObject({
+      expect(events[2]).toMatchObject({
         type: "status",
         status: "events_truncated",
       });
