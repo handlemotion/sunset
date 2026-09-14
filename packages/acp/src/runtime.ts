@@ -40,6 +40,7 @@ function isAuthError(error: unknown): boolean {
 }
 
 const DEFAULT_CONTROL_TIMEOUT_MS = 30_000;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 /** Rejects a control-plane request that outlives its deadline. */
 export class AcpRequestTimeoutError extends Error {
@@ -59,7 +60,7 @@ function isTimeoutError(error: unknown): boolean {
 function controlTimeoutMs(): number {
   const parsed = Number(process.env.SUNSET_ACP_TIMEOUT_MS);
   return Number.isFinite(parsed) && parsed > 0
-    ? parsed
+    ? Math.min(parsed, MAX_TIMER_DELAY_MS)
     : DEFAULT_CONTROL_TIMEOUT_MS;
 }
 

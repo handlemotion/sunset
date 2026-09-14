@@ -271,6 +271,31 @@ describe("createEngine over ACP", () => {
     }
   });
 
+  it("clamps an oversized timeout to Node's maximum timer delay", async () => {
+    vi.useFakeTimers();
+    process.env.SUNSET_ACP_TIMEOUT_MS = "3000000000";
+    try {
+      const app = acpAgent({ name: "fake-acp" });
+      app.onRequest("initialize", () => new Promise<never>(() => undefined));
+      const engine = createEngine(ENGINES.devin, {
+        connector: inProcessConnector(() => app),
+      });
+      const pending = engine.create({
+        cwd: "/tmp",
+        model: { id: "default", params: [] },
+      });
+      const assertion = expect(pending).rejects.toMatchObject({
+        method: "initialize",
+        timeoutMs: 2_147_483_647,
+      });
+      await vi.advanceTimersByTimeAsync(2_147_483_647);
+      await assertion;
+    } finally {
+      delete process.env.SUNSET_ACP_TIMEOUT_MS;
+      vi.useRealTimers();
+    }
+  });
+
   it("leaves session/prompt unbounded and emits a final usage event", async () => {
     process.env.SUNSET_ACP_TIMEOUT_MS = "50";
     try {
