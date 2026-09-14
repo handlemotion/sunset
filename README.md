@@ -38,8 +38,8 @@ engines resolve.
 ### Config file
 
 `sunset` reads `~/.config/sunset/config.json` (override the path with
-`SUNSET_CONFIG`). All keys are optional; unknown keys and invalid values warn
-and are ignored:
+`SUNSET_CONFIG`). All keys are optional; unknown keys or invalid values warn
+and cause the whole file to be ignored:
 
 ```json
 {
