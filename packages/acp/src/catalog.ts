@@ -176,14 +176,24 @@ function codexCatalog(entries: CodexCatalogEntry[], currentModelId?: string) {
   return models;
 }
 
-let codexCatalogCache: Promise<ModelCapability[]> | null = null;
+const CODEX_CATALOG_TTL_MS = 60 * 60 * 1000;
+
+let codexCatalogCache: {
+  fetchedAt: number;
+  result: Promise<ModelCapability[]>;
+} | null = null;
+
+/** Internal test hook: drop the cached codex catalog to force a re-probe. */
+export function resetCatalogCache(): void {
+  codexCatalogCache = null;
+}
 
 /**
  * Probe the codex adapter for its live catalog — `session/new` returns
  * `models.availableModels`. Falls back to the static list on any failure.
  */
-function listCodexModels(): Promise<ModelCapability[]> {
-  codexCatalogCache ??= (async () => {
+function probeCodexCatalog(): Promise<ModelCapability[]> {
+  return (async () => {
     try {
       const spawn = await resolveEngineSpawn("codex");
       const conn = await stdioConnector({
@@ -225,7 +235,19 @@ function listCodexModels(): Promise<ModelCapability[]> {
       return DEFAULT_CODEX_CATALOG;
     }
   })();
-  return codexCatalogCache;
+}
+
+function listCodexModels(): Promise<ModelCapability[]> {
+  if (
+    !codexCatalogCache ||
+    Date.now() - codexCatalogCache.fetchedAt >= CODEX_CATALOG_TTL_MS
+  ) {
+    codexCatalogCache = {
+      fetchedAt: Date.now(),
+      result: probeCodexCatalog(),
+    };
+  }
+  return codexCatalogCache.result;
 }
 
 export async function listModels(engine: EngineId): Promise<ModelCapability[]> {

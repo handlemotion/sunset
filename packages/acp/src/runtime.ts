@@ -31,30 +31,88 @@ import type {
 
 const PLAN_MODE_CANDIDATES = ["plan", "read-only", "read_only"];
 const SESSION_CLOSE_TIMEOUT_MS = 2_000;
-const ENGINE_STARTUP_TIMEOUT_MS = 30_000;
-
-function startupRequest<T>(
-  conn: AcpConnectionHandle,
-  request: () => Promise<T>,
-): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  return new Promise<T>((resolve, reject) => {
-    timer = setTimeout(() => {
-      conn.close();
-      reject(new Error("engine_startup_timeout"));
-    }, ENGINE_STARTUP_TIMEOUT_MS);
-    timer.unref();
-    request().then(resolve, reject);
-  }).finally(() => {
-    if (timer) clearTimeout(timer);
-  });
-}
 
 function isAuthError(error: unknown): boolean {
   return (
     error instanceof Error &&
     /not authenticated|authenticate|unauthorized|401/i.test(error.message)
   );
+}
+
+const DEFAULT_CONTROL_TIMEOUT_MS = 30_000;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+/** Rejects a control-plane request that outlives its deadline. */
+export class AcpRequestTimeoutError extends Error {
+  constructor(
+    readonly method: string,
+    readonly timeoutMs: number,
+  ) {
+    super(`acp_request_timeout:${method} after ${timeoutMs}ms`);
+    this.name = "AcpRequestTimeoutError";
+  }
+}
+
+function isTimeoutError(error: unknown): boolean {
+  return error instanceof AcpRequestTimeoutError;
+}
+
+function controlTimeoutMs(): number {
+  const parsed = Number(process.env.SUNSET_ACP_TIMEOUT_MS);
+  return Number.isFinite(parsed) && parsed > 0
+    ? Math.min(parsed, MAX_TIMER_DELAY_MS)
+    : DEFAULT_CONTROL_TIMEOUT_MS;
+}
+
+/**
+ * Bounded `conn.request` for control-plane methods: a wedged agent must not
+ * hang session setup forever. On timeout the connection is closed so a
+ * half-initialized session can't linger. `session/prompt` stays unbounded —
+ * cancellation is its escape hatch.
+ */
+function controlRequest(
+  conn: AcpConnectionHandle,
+  method: string,
+  params: unknown,
+): Promise<unknown> {
+  const timeoutMs = controlTimeoutMs();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      conn.close();
+      reject(new AcpRequestTimeoutError(method, timeoutMs));
+    }, timeoutMs);
+    conn.request(method, params).then(
+      (response) => {
+        clearTimeout(timer);
+        resolve(response);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+/**
+ * Pull a `{used, size}` usage payload off a `session/prompt` response —
+ * adapters report it via `usage` or `_meta.quota`.
+ */
+function promptUsage(response: unknown): { used: number; size: number } | null {
+  if (typeof response !== "object" || response === null) return null;
+  const record = response as Record<string, unknown>;
+  const meta =
+    typeof record._meta === "object" && record._meta !== null
+      ? (record._meta as Record<string, unknown>)
+      : null;
+  for (const candidate of [record.usage, meta?.quota]) {
+    if (typeof candidate !== "object" || candidate === null) continue;
+    const usage = candidate as Record<string, unknown>;
+    if (typeof usage.used === "number" && typeof usage.size === "number") {
+      return { used: usage.used, size: usage.size };
+    }
+  }
+  return null;
 }
 
 type Turn = {
@@ -118,6 +176,11 @@ class AcpSession implements EngineSessionHandle {
       .request("session/prompt", {
         sessionId: this.providerSessionId,
         prompt: [{ type: "text", text: prompt }],
+      })
+      .then((response) => {
+        const usage = promptUsage(response);
+        if (usage) queue.push({ type: "usage", ...usage });
+        return response;
       })
       .finally(() => queue.finish());
     const conn = this.conn;
@@ -202,13 +265,12 @@ async function applyModel(
 ): Promise<void> {
   if (!model.id) return;
   try {
-    await startupRequest(conn, () =>
-      conn.request("session/set_model", {
-        sessionId,
-        modelId: codexModelId(model),
-      }),
-    );
+    await controlRequest(conn, "session/set_model", {
+      sessionId,
+      modelId: codexModelId(model),
+    });
   } catch (error) {
+    if (isTimeoutError(error)) throw error;
     // Older adapters without set_model keep their spawn-time default.
     if (
       error instanceof Error &&
@@ -232,13 +294,16 @@ async function applyMode(
     available.includes(candidate),
   );
   if (!target) return;
-  await startupRequest(conn, () =>
-    conn.request("session/set_mode", { sessionId, modeId: target }),
-  ).catch((error) => {
-    if (error instanceof Error && error.message === "engine_startup_timeout") {
-      throw error;
-    }
-  });
+  try {
+    await controlRequest(conn, "session/set_mode", {
+      sessionId,
+      modeId: target,
+    });
+  } catch (error) {
+    // set_mode is best-effort, but a timeout already closed the connection —
+    // the session must not come back looking usable.
+    if (isTimeoutError(error)) throw error;
+  }
 }
 
 export function createEngine(
@@ -290,16 +355,14 @@ export function createEngine(
     const conn = await connectorFor(input, session);
     session.conn = conn;
 
-    const init = (await startupRequest(conn, () =>
-      conn.request("initialize", {
-        protocolVersion: 1,
-        clientCapabilities: {
-          fs: { readTextFile: false, writeTextFile: false },
-          terminal: false,
-        },
-        clientInfo: { name: "sunset", title: "Sunset", version: "0.0.1" },
-      }),
-    )) as {
+    const init = (await controlRequest(conn, "initialize", {
+      protocolVersion: 1,
+      clientCapabilities: {
+        fs: { readTextFile: false, writeTextFile: false },
+        terminal: false,
+      },
+      clientInfo: { name: "sunset", title: "Sunset", version: "0.0.1" },
+    })) as {
       agentCapabilities?: {
         loadSession?: boolean;
         sessionCapabilities?: { resume?: boolean };
@@ -314,12 +377,10 @@ export function createEngine(
           "engine requires authentication but advertises no methods",
         );
       }
-      await startupRequest(conn, () =>
-        conn.request("authenticate", {
-          methodId: method,
-          ...(input.apiKey ? { _meta: { api_key: input.apiKey } } : {}),
-        }),
-      );
+      await controlRequest(conn, "authenticate", {
+        methodId: method,
+        ...(input.apiKey ? { _meta: { api_key: input.apiKey } } : {}),
+      });
     }
 
     if (providerSessionId) {
@@ -332,40 +393,36 @@ export function createEngine(
         throw new Error("session_resume_unsupported");
       }
       try {
-        await startupRequest(conn, () =>
-          conn.request("session/resume", {
-            sessionId: providerSessionId,
-            cwd: input.cwd,
-            mcpServers: [],
-          }),
-        );
+        await controlRequest(conn, "session/resume", {
+          sessionId: providerSessionId,
+          cwd: input.cwd,
+          mcpServers: [],
+        });
       } catch (resumeError) {
         if (isAuthError(resumeError)) {
           await authenticate();
           try {
-            await startupRequest(conn, () =>
-              conn.request("session/resume", {
-                sessionId: providerSessionId,
-                cwd: input.cwd,
-                mcpServers: [],
-              }),
-            );
+            await controlRequest(conn, "session/resume", {
+              sessionId: providerSessionId,
+              cwd: input.cwd,
+              mcpServers: [],
+            });
             if (definition.modelViaSetModel) {
               await applyModel(conn, providerSessionId, input.model);
             }
             return session;
-          } catch {
+          } catch (retryError) {
+            if (isTimeoutError(retryError)) throw retryError;
             // fall through to session/load
           }
         }
+        if (isTimeoutError(resumeError)) throw resumeError;
         try {
-          await startupRequest(conn, () =>
-            conn.request("session/load", {
-              sessionId: providerSessionId,
-              cwd: input.cwd,
-              mcpServers: [],
-            }),
-          );
+          await controlRequest(conn, "session/load", {
+            sessionId: providerSessionId,
+            cwd: input.cwd,
+            mcpServers: [],
+          });
           if (definition.modelViaSetModel) {
             await applyModel(conn, providerSessionId, input.model);
           }
@@ -373,24 +430,24 @@ export function createEngine(
           if (isAuthError(error)) {
             await authenticate();
             try {
-              await startupRequest(conn, () =>
-                conn.request("session/load", {
-                  sessionId: providerSessionId,
-                  cwd: input.cwd,
-                  mcpServers: [],
-                }),
-              );
+              await controlRequest(conn, "session/load", {
+                sessionId: providerSessionId,
+                cwd: input.cwd,
+                mcpServers: [],
+              });
               if (definition.modelViaSetModel) {
                 await applyModel(conn, providerSessionId, input.model);
               }
               return session;
             } catch (retry) {
+              if (isTimeoutError(retry)) throw retry;
               conn.close();
               throw new Error(
                 `session_resume_failed:${retry instanceof Error ? retry.message : "unknown"}`,
               );
             }
           }
+          if (isTimeoutError(error)) throw error;
           conn.close();
           throw new Error(
             `session_resume_failed:${error instanceof Error ? error.message : "unknown"}`,
@@ -405,23 +462,19 @@ export function createEngine(
 
     let created: { sessionId: string; modes?: SessionModeState };
     try {
-      created = (await startupRequest(conn, () =>
-        conn.request("session/new", {
-          cwd: input.cwd,
-          mcpServers: [],
-        }),
-      )) as { sessionId: string; modes?: SessionModeState };
+      created = (await controlRequest(conn, "session/new", {
+        cwd: input.cwd,
+        mcpServers: [],
+      })) as { sessionId: string; modes?: SessionModeState };
     } catch (error) {
       if (!isAuthError(error)) throw error;
       // Engines like `devin acp` keep credentials per-process: authenticate
       // once on this connection, then retry session creation.
       await authenticate();
-      created = (await startupRequest(conn, () =>
-        conn.request("session/new", {
-          cwd: input.cwd,
-          mcpServers: [],
-        }),
-      )) as { sessionId: string; modes?: SessionModeState };
+      created = (await controlRequest(conn, "session/new", {
+        cwd: input.cwd,
+        mcpServers: [],
+      })) as { sessionId: string; modes?: SessionModeState };
     }
     session.providerSessionId = created.sessionId;
     if (definition.modelViaSetModel) {
