@@ -150,12 +150,19 @@ export async function validatePatch(input: {
     const checkResults: ValidatedPatch["checks"] = [];
     for (const command of input.checks) {
       beforeDeadline(input.deadlineAt);
+      // Check commands run arbitrary patched code, so the base is frozen:
+      // .git, every tracked file outside src/test dirs, and the src/test
+      // dirs themselves are ro-bound; only dependency installation gets a
+      // network namespace.
       const result = await box.exec(
         [
           "bash",
           "-lc",
           `set -e; cd '${root}';
-exec bwrap --die-with-parent --unshare-pid --unshare-user --unshare-uts --unshare-ipc --unshare-net --clearenv --setenv PATH /usr/local/bin:/usr/bin:/bin --setenv HOME /tmp --ro-bind / / --proc /proc --dev /dev --tmpfs /tmp --tmpfs /workspace/home --bind '${root}' '${root}' --chdir '${root}' ${command.join(" ")}`,
+mounts=(--ro-bind '${root}/.git' '${root}/.git');
+while IFS= read -r -d '' path; do mounts+=(--ro-bind "${root}/$path" "${root}/$path"); done < <(git ls-files -z -- ':!:**/src/**' ':!:**/test/**' ':!:**/tests/**');
+while IFS= read -r -d '' path; do mounts+=(--ro-bind "${root}/$path" "${root}/$path"); done < <(find . -type d -name node_modules -prune -o -type d '(' -name src -o -name test -o -name tests ')' -prune -print0);
+exec bwrap --die-with-parent --unshare-pid --unshare-user --unshare-uts --unshare-ipc ${command[1] === "install" ? "" : "--unshare-net"} --clearenv --setenv PATH /usr/local/bin:/usr/bin:/bin --setenv HOME /tmp --ro-bind / / --proc /proc --dev /dev --tmpfs /tmp --tmpfs /workspace/home --bind '${root}' '${root}' "\${mounts[@]}" --chdir '${root}' ${command.join(" ")}`,
         ],
         Math.max(1, input.deadlineAt - Date.now() - 1_000),
       );
@@ -514,4 +521,49 @@ export async function publishPatch(input: {
       validation: input.validated.checks,
     };
   }
+}
+
+/**
+ * Recover after `publication_unknown`: reuse the branch only when its head
+ * commit carries the patch digest, then list pulls for it rather than
+ * repeating PR creation. Returns null when the branch was never written.
+ */
+export async function reconcilePublication(input: {
+  repo: PublishRepo;
+  credentials: GithubAppCredentials;
+  branch: string;
+  patchDigest: string;
+}): Promise<{
+  commitSha: string;
+  pull: { number: number; url: string };
+} | null> {
+  const token = await installationToken(input.credentials, input.repo);
+  const ref = await github(
+    input.repo,
+    token,
+    "GET",
+    `/git/ref/heads/${encodeURIComponent(input.branch)}`,
+    undefined,
+    z.object({ object: ShaSchema }),
+    true,
+  );
+  if (!ref) return null;
+  const commit = await github(
+    input.repo,
+    token,
+    "GET",
+    `/git/commits/${ref.object.sha}`,
+    undefined,
+    z.object({ message: z.string() }),
+  );
+  if (!commit?.message.includes(`Sunset-Patch: ${input.patchDigest}`)) {
+    throw new Error("publication_branch_conflict");
+  }
+  const pull = await existingPull(input.repo, token, input.branch);
+  return pull
+    ? {
+        commitSha: ref.object.sha,
+        pull: { number: pull.number, url: pull.html_url },
+      }
+    : null;
 }

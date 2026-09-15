@@ -4,6 +4,7 @@ export {
   githubAppJwt,
   installationToken,
   publishPatch,
+  reconcilePublication,
   validatePatch,
   validatePatchEnvelope,
   type CommitIdentity,

@@ -14,3 +14,8 @@ Activation requires all of:
 - Publication credentials stay outside agent sandboxes entirely.
 - No incident-specific logic from Transitive's `apps/sunset` may be copied in
   without being re-scoped to generic workspace execution.
+
+The Box commissioning proof sequence, sandbox requirements, and triage guide
+live in [RUNBOOK.md](RUNBOOK.md). The persistent-box run lifecycle and the
+locked-down `codex exec` task body live in `@sunset/box`
+(`run.ts`, `codex.ts`).

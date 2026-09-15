@@ -50,7 +50,9 @@ browser (apps/web)
 ported but inactive — nothing on the local path calls them:
 
 - [packages/box](../packages/box) — Upstash Box client: persistent/ephemeral
-  boxes, exec, file read/write, GitHub repo bundles.
+  boxes, exec, exec-session WebSocket, file read/write, GitHub repo bundles,
+  plus the flock-serialized run supervisor (`launchRun`/`inspectRun`/
+  `terminateRun`/`findRun`) and the locked-down `codex exec` task body.
 - [packages/publish](../packages/publish) — GitHub draft-PR publication and
   patch validation.
 - [apps/engine](../apps/engine) — Cloudflare Worker control plane;
