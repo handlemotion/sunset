@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "@sunset/acp": "workspace:*",
+    "@sunset/api": "workspace:*",
     "@sunset/domain": "workspace:*",
     "@sunset/host": "workspace:*",
     "@sunset/server": "workspace:*"

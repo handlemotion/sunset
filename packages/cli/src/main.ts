@@ -6,9 +6,20 @@ import { fileURLToPath } from "node:url";
 
 import { createHost } from "@sunset/host";
 import { createSunsetServer } from "@sunset/server";
+import type { SunsetClient } from "@sunset/api";
+import type { AgentMode } from "@sunset/domain";
 
+import { resolveBackend, resolveClient } from "./client.js";
+import {
+  attachRunNdjson,
+  createSession,
+  printJson,
+  runExitCode,
+  sendPrompt,
+} from "./commands.js";
 import { loadConfig, resolveConfig, type ResolvedConfig } from "./config.js";
 import { runDoctor } from "./doctor.js";
+import { announceServer, serverRecordPath } from "./server-discovery.js";
 import { withSessionDefaults } from "./session-defaults.js";
 
 const HELP = `sunset — browser development workspace
@@ -23,6 +34,17 @@ Usage:
   sunset workspaces create <project-id> <slug> [--state-dir DIR]
   sunset workspaces list <project-id> [--state-dir DIR]
   sunset capabilities [--state-dir DIR]
+
+Agent commands — require a running \`sunset serve\`; output is JSON:
+  sunset sessions create <workspace-id> --prompt TEXT
+                         [--engine devin|codex] [--model ID] [--mode agent|plan]
+  sunset sessions list <workspace-id>
+  sunset send <session-id> <prompt...>
+  sunset runs list <session-id>
+  sunset runs wait <run-id>
+  sunset runs cancel <run-id>
+  sunset attach <run-id> [--after N] — stream run events as NDJSON
+
   sunset help | --help
   sunset --version
 
@@ -129,6 +151,16 @@ async function serve(
     webDist: webDist(args),
     ...(config.port !== undefined ? { port: config.port } : {}),
   });
+  let removeRecord: (() => Promise<void>) | undefined;
+  try {
+    removeRecord = await announceServer(config.stateDir, server);
+  } catch (error) {
+    console.error(
+      `warning: could not write ${serverRecordPath(config.stateDir)}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
   const url = `${server.url}/?token=${server.token}`;
   console.log(`sunset is running`);
   console.log(`  url:   ${url}`);
@@ -136,13 +168,123 @@ async function serve(
   if (open) await openBrowser(url);
 
   const shutdown = () => {
-    void server
-      .close()
+    void Promise.resolve(removeRecord?.())
+      .then(() => server.close())
       .then(() => host.close())
       .then(() => process.exit(0));
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+}
+
+/** Commands that only work against a running `sunset serve`. */
+const SERVER_ONLY = new Set(["sessions", "send", "runs", "attach"]);
+/** Commands served by the API when live, by a direct host otherwise. */
+const SHARED = new Set(["projects", "workspaces", "capabilities"]);
+
+function parseMode(value: string): AgentMode | undefined {
+  return value === "agent" || value === "plan" ? value : undefined;
+}
+
+function parseAfter(value: string): number | undefined {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+/** Dispatches a server-only command. Returns the process exit code. */
+async function runServerCommand(
+  client: SunsetClient,
+  config: ResolvedConfig,
+  command: string,
+  rest: string[],
+  args: string[],
+): Promise<number> {
+  switch (command) {
+    case "sessions": {
+      if (args[0] === "create" && args[1]) {
+        const prompt = flag(rest, "prompt") ?? args.slice(2).join(" ");
+        if (!prompt) {
+          console.error("sunset sessions create: --prompt is required");
+          return 2;
+        }
+        const modeFlag = flag(rest, "mode");
+        const mode = modeFlag === undefined ? undefined : parseMode(modeFlag);
+        if (modeFlag !== undefined && mode === undefined) {
+          console.error(
+            `invalid --mode "${modeFlag}": expected "agent" or "plan"`,
+          );
+          return 2;
+        }
+        printJson(
+          await createSession(client, config, {
+            workspaceId: args[1],
+            prompt,
+            ...(mode ? { mode } : {}),
+          }),
+        );
+        return 0;
+      }
+      if (args[0] === "list" && args[1]) {
+        printJson(await client.listSessions(args[1]));
+        return 0;
+      }
+      usage();
+    }
+    case "send": {
+      const sessionId = args[0];
+      if (!sessionId) usage();
+      const prompt = flag(rest, "prompt") ?? args.slice(1).join(" ");
+      if (!prompt) {
+        console.error("usage: sunset send <session-id> <prompt>");
+        return 2;
+      }
+      printJson(await sendPrompt(client, sessionId, prompt));
+      return 0;
+    }
+    case "runs": {
+      if (args[0] === "list" && args[1]) {
+        printJson(await client.listRuns(args[1]));
+        return 0;
+      }
+      if (args[0] === "wait" && args[1]) {
+        const result = await client.waitRun(args[1]);
+        printJson(result);
+        return runExitCode(result.status);
+      }
+      if (args[0] === "cancel" && args[1]) {
+        printJson(await client.cancelRun(args[1]));
+        return 0;
+      }
+      usage();
+    }
+    case "attach": {
+      const runId = args[0];
+      if (!runId) usage();
+      const afterFlag = flag(rest, "after");
+      const after = afterFlag === undefined ? undefined : parseAfter(afterFlag);
+      if (afterFlag !== undefined && after === undefined) {
+        console.error(
+          `invalid --after "${afterFlag}": expected a nonnegative integer`,
+        );
+        return 2;
+      }
+      const run = await attachRunNdjson(client, runId, { after }, (line) =>
+        console.log(line),
+      );
+      if (run === null) {
+        console.error(`sunset attach: run ${runId} not found`);
+        return runExitCode("missing");
+      }
+      if (run.status !== "finished") {
+        console.error(
+          `sunset attach: run ${run.id} ended with status "${run.status}"`,
+        );
+      }
+      return runExitCode(run.status);
+    }
+    default:
+      usage();
+  }
 }
 
 async function main(): Promise<void> {
@@ -180,43 +322,55 @@ async function main(): Promise<void> {
   if (command === "serve") return serve(resolved, rest, false);
   if (command === "open") return serve(resolved, rest, true);
 
-  const host = await createHost({
-    stateDir: resolved.stateDir,
-    worktreeRoot: resolved.worktreeRoot,
-  });
+  const args = positional(rest);
+
+  if (SERVER_ONLY.has(command)) {
+    const client = await resolveClient(resolved);
+    if (!client) {
+      console.error(
+        `sunset ${command}: requires a running server — start one with \`sunset serve\``,
+      );
+      process.exitCode = 1;
+      return;
+    }
+    process.exitCode = await runServerCommand(
+      client,
+      resolved,
+      command,
+      rest,
+      args,
+    );
+    return;
+  }
+
+  if (!SHARED.has(command)) usage();
+
+  const backend = await resolveBackend(resolved);
   try {
-    const args = positional(rest);
     switch (command) {
       case "projects": {
         if (args[0] === "add" && args[1]) {
-          console.log(await host.projects.register(args[1]));
+          printJson(await backend.addProject(args[1]));
         } else if (args[0] === "list") {
-          console.log(host.projects.list());
+          printJson(await backend.listProjects());
         } else usage();
         break;
       }
       case "workspaces": {
         if (args[0] === "create" && args[1] && args[2]) {
-          console.log(
-            await host.workspaces.create({
-              projectId: args[1],
-              slug: args[2],
-            }),
-          );
+          printJson(await backend.createWorkspace(args[1], { slug: args[2] }));
         } else if (args[0] === "list" && args[1]) {
-          console.log(host.workspaces.list({ projectId: args[1] }));
+          printJson(await backend.listWorkspaces(args[1]));
         } else usage();
         break;
       }
       case "capabilities": {
-        console.log(await host.capabilities());
+        printJson(await backend.capabilities());
         break;
       }
-      default:
-        usage();
     }
   } finally {
-    await host.close();
+    await backend.close();
   }
 }
 
