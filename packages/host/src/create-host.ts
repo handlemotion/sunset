@@ -390,6 +390,20 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
     return value;
   }
 
+  function requireWorktreePath(workspace: Workspace): string {
+    const worktreePath = path.resolve(workspace.worktreePath);
+    if (
+      !isPathInside(worktreeRoot, worktreePath) ||
+      worktreePath === worktreeRoot
+    ) {
+      throw new HostError(
+        `workspace path escapes worktreeRoot: ${workspace.worktreePath}`,
+        "worktree_path_invalid",
+      );
+    }
+    return worktreePath;
+  }
+
   function requireSession(id: string): Session {
     const value = state.getSession(id);
     if (!value) {
@@ -1553,6 +1567,34 @@ export async function createHost(options: CreateHostOptions): Promise<Host> {
           }
           throw error;
         }
+      },
+      async diff(input) {
+        assertOpen();
+        const workspace = requireWorkspace(input.workspaceId);
+        if (workspace.archivedAt !== null) {
+          throw new HostError("workspace is archived", "workspace_archived");
+        }
+        const worktreePath = requireWorktreePath(workspace);
+        const project = requireProject(workspace.projectId);
+        return git.diffWorktree({
+          repoRoot: project.repoRoot,
+          worktreePath,
+          baseRef: input.baseRef ?? workspace.baseRef,
+        });
+      },
+      async commit(input) {
+        assertOpen();
+        const workspace = requireWorkspace(input.workspaceId);
+        if (workspace.archivedAt !== null) {
+          throw new HostError("workspace is archived", "workspace_archived");
+        }
+        const worktreePath = requireWorktreePath(workspace);
+        const project = requireProject(workspace.projectId);
+        return git.commitWorktree({
+          repoRoot: project.repoRoot,
+          worktreePath,
+          message: input.message,
+        });
       },
     },
     sessions: {

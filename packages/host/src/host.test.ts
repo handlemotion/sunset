@@ -572,6 +572,55 @@ describe("createHost", () => {
     await host.close();
   });
 
+  it("diffs and commits workspace worktree changes", async () => {
+    const { host, repo } = await setup();
+    const project = await host.projects.register(repo);
+    const workspace = await host.workspaces.create({
+      projectId: project.id,
+      slug: "diff-commit",
+      baseRef: "main",
+    });
+    await writeFile(
+      path.join(workspace.worktreePath, "feature.txt"),
+      "from agent\n",
+    );
+    await writeFile(path.join(workspace.worktreePath, "README.md"), "edited\n");
+
+    const diff = await host.workspaces.diff({ workspaceId: workspace.id });
+    expect(diff.diff).toContain("feature.txt");
+    expect(diff.diff).toContain("+from agent");
+    expect(diff.diff).toContain("+edited");
+    expect(diff.stat).toContain("feature.txt");
+
+    const committed = await host.workspaces.commit({
+      workspaceId: workspace.id,
+      message: "agent work",
+    });
+    const head = await execa("git", ["rev-parse", "HEAD"], {
+      cwd: workspace.worktreePath,
+    });
+    expect(committed.commit).toBe(head.stdout.trim());
+    const subject = await execa("git", ["log", "-1", "--format=%s"], {
+      cwd: workspace.worktreePath,
+    });
+    expect(subject.stdout).toBe("agent work");
+    const branch = await execa("git", ["branch", "--show-current"], {
+      cwd: workspace.worktreePath,
+    });
+    expect(branch.stdout).toBe("sunset/diff-commit");
+
+    const clean = await host.workspaces.diff({
+      workspaceId: workspace.id,
+      baseRef: "HEAD",
+    });
+    expect(clean.diff).toBe("");
+
+    await expect(
+      host.workspaces.diff({ workspaceId: "missing" }),
+    ).rejects.toMatchObject({ code: "unknown_workspace" });
+    await host.close();
+  });
+
   it("rejects malformed retention environment configuration", async () => {
     const root = await tempDir("state");
     const restoreMaxEvents = setEnv("SUNSET_MAX_EVENTS_PER_RUN", "abc");

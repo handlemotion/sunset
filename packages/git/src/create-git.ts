@@ -10,8 +10,10 @@ import path from "node:path";
 
 import pLimit from "p-limit";
 
+import { commitWorktree } from "./commit.js";
 import { loadWorktreeConfig } from "./config.js";
 import { assertCopyGlobs, copyGlobs } from "./copy.js";
+import { diffWorktree } from "./diff.js";
 import { GitError } from "./errors.js";
 import { RepositoryLease } from "./lease.js";
 import { RepoLock } from "./lock.js";
@@ -24,6 +26,7 @@ import {
 import { parseWorktreePorcelain } from "./porcelain.js";
 import { runSetupCommand } from "./setup.js";
 import { defaultGitSpawn } from "./spawn.js";
+import type { WorktreeContext } from "./worktree.js";
 import type {
   ArchiveWorktreeInput,
   CreateGitOptions,
@@ -829,9 +832,18 @@ export function createGit(options: CreateGitOptions = {}): GitService {
     );
   }
 
+  const worktreeContext: WorktreeContext = {
+    git,
+    locks,
+    leases,
+    resolveRepository,
+  };
+
   return {
     inspectRepository,
     advanceWorkspaceOperation,
+    diffWorktree: (input) => diffWorktree(worktreeContext, input),
+    commitWorktree: (input) => commitWorktree(worktreeContext, input),
 
     async listWorktrees(repoRoot) {
       return (await inspectRepository(repoRoot)).worktrees;

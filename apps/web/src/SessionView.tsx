@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-import { api, runEvents } from "./api";
+import { api, runEvents, type WorktreeDiff } from "./api";
 import type {
   AgentEvent,
   EngineCapabilities,
@@ -111,6 +111,11 @@ export function SessionView(props: Props) {
   const [engineId, setEngineId] = useState(session?.engine ?? "devin");
   const [modelId, setModelId] = useState(session?.model.id ?? "");
   const [busy, setBusy] = useState(false);
+  const [diffOpen, setDiffOpen] = useState(false);
+  const [diff, setDiff] = useState<WorktreeDiff | null>(null);
+  const [diffError, setDiffError] = useState<string | null>(null);
+  const [commitMessage, setCommitMessage] = useState("");
+  const [commitBusy, setCommitBusy] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -125,6 +130,37 @@ export function SessionView(props: Props) {
   const engine = engines.find((entry) => entry.id === engineId);
   const models = engine?.models ?? [];
   const selectedModel = modelId || models[0]?.id || "";
+
+  async function toggleDiff() {
+    if (diffOpen) {
+      setDiffOpen(false);
+      return;
+    }
+    setDiffOpen(true);
+    setDiffError(null);
+    try {
+      setDiff(await api.workspaceDiff(workspace.id));
+    } catch (error) {
+      setDiff(null);
+      setDiffError(error instanceof Error ? error.message : "diff failed");
+    }
+  }
+
+  async function commit() {
+    const message = commitMessage.trim();
+    if (!message || commitBusy) return;
+    setCommitBusy(true);
+    setDiffError(null);
+    try {
+      await api.commitWorkspace(workspace.id, message);
+      setCommitMessage("");
+      setDiff(await api.workspaceDiff(workspace.id));
+    } catch (error) {
+      setDiffError(error instanceof Error ? error.message : "commit failed");
+    } finally {
+      setCommitBusy(false);
+    }
+  }
 
   async function submit() {
     const text = prompt.trim();
@@ -192,6 +228,12 @@ export function SessionView(props: Props) {
           </div>
         )}
         <div className="flex-1" />
+        <button
+          onClick={() => void toggleDiff()}
+          className="rounded border border-neutral-800 px-2 py-1 text-xs text-neutral-400 hover:text-neutral-200"
+        >
+          {diffOpen ? "Hide diff" : "Diff"}
+        </button>
         {runs.length > 0 && runs[runs.length - 1]?.status === "running" && (
           <button
             onClick={() => void api.cancelRun(runs[runs.length - 1]!.id)}
@@ -201,6 +243,44 @@ export function SessionView(props: Props) {
           </button>
         )}
       </div>
+      {diffOpen && (
+        <div className="border-b border-neutral-800 px-4 py-3">
+          {diffError && (
+            <div className="mb-2 text-xs text-red-400">{diffError}</div>
+          )}
+          {diff ? (
+            <>
+              {diff.stat && (
+                <div className="mb-2 whitespace-pre-wrap font-mono text-[11px] text-neutral-500">
+                  {diff.stat}
+                </div>
+              )}
+              <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded border border-neutral-800 bg-neutral-900/60 p-2 font-mono text-[11px] text-neutral-300">
+                {diff.diff || "No changes"}
+              </pre>
+              <div className="mt-2 flex gap-2">
+                <input
+                  value={commitMessage}
+                  onChange={(event) => setCommitMessage(event.target.value)}
+                  placeholder="Commit message…"
+                  className="min-w-0 flex-1 rounded border border-neutral-800 bg-neutral-900 px-2 py-1 text-xs text-neutral-200 outline-none placeholder:text-neutral-600 focus:border-neutral-600"
+                />
+                <button
+                  onClick={() => void commit()}
+                  disabled={commitBusy || !commitMessage.trim()}
+                  className="rounded border border-neutral-800 px-2 py-1 text-xs text-neutral-400 hover:text-neutral-200 disabled:opacity-40"
+                >
+                  Commit
+                </button>
+              </div>
+            </>
+          ) : (
+            !diffError && (
+              <div className="text-[11px] text-neutral-600">loading diff…</div>
+            )
+          )}
+        </div>
+      )}
       <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
         {runs.map((run) => (
           <RunView key={run.id} run={run} />

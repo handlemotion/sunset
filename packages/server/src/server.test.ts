@@ -55,6 +55,17 @@ function stubHost(
       async archive() {
         return { ...workspace, archivedAt: 1 };
       },
+      async diff(input) {
+        return {
+          worktreePath: "/tmp/wt",
+          head: "abc123",
+          diff: `diff --git a/f b/f (base:${input.baseRef ?? "none"})`,
+          stat: " 1 file changed",
+        };
+      },
+      async commit(input) {
+        return { commit: "def456", summary: input.message };
+      },
     },
     sessions: {
       async create({ prompt }) {
@@ -220,6 +231,37 @@ describe("createSunsetServer", () => {
       headers,
     });
     expect(cancel.status).toBe(200);
+    await server.close();
+  });
+
+  it("serves workspace diff and commit routes", async () => {
+    const server = await createSunsetServer({ host: stubHost() });
+    const headers = { authorization: `Bearer ${server.token}` };
+
+    const diff = await fetch(`${server.url}/api/workspaces/w1/diff?base=main`, {
+      headers,
+    });
+    expect(diff.status).toBe(200);
+    const diffBody = (await diff.json()) as { diff: string; stat: string };
+    expect(diffBody.diff).toContain("base:main");
+
+    const noBase = await fetch(`${server.url}/api/workspaces/w1/diff`, {
+      headers,
+    });
+    const noBaseBody = (await noBase.json()) as { diff: string };
+    expect(noBaseBody.diff).toContain("base:none");
+
+    const commit = await fetch(`${server.url}/api/workspaces/w1/commit`, {
+      method: "POST",
+      headers: { ...headers, "content-type": "application/json" },
+      body: JSON.stringify({ message: "ship it" }),
+    });
+    expect(commit.status).toBe(200);
+    const commitBody = (await commit.json()) as {
+      commit: string;
+      summary: string;
+    };
+    expect(commitBody).toEqual({ commit: "def456", summary: "ship it" });
     await server.close();
   });
 

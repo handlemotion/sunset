@@ -68,6 +68,9 @@ const KNOWN_EVENT_TYPES: ReadonlySet<string> = new Set([
   "plan",
   "mode",
   "status",
+  "usage",
+  "session_title",
+  "commands",
   "error",
 ]);
 

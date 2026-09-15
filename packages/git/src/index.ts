@@ -3,9 +3,11 @@ export { GitError, isGitError } from "./errors.js";
 export { isPathInside } from "./paths.js";
 export type {
   ArchiveWorktreeInput,
+  CommitWorktreeInput,
   CreateGitOptions,
   CreateWorktreeInput,
   CreatedWorktree,
+  DiffWorktreeInput,
   GitService,
   GitSpawn,
   GitSpawnResult,
@@ -16,4 +18,6 @@ export type {
   WorkspaceOperationAttentionReason,
   WorkspaceOperationStepInput,
   WorkspaceOperationStepResult,
+  WorktreeCommit,
+  WorktreeDiff,
 } from "./types.js";

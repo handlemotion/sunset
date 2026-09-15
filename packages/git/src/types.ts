@@ -37,7 +37,11 @@ export type RepositoryLeaseOwner = {
   leaseId: string;
   repositoryIdentity: string;
   operation:
-    "create_worktree" | "archive_worktree" | "recover_workspace_operation";
+    | "create_worktree"
+    | "archive_worktree"
+    | "recover_workspace_operation"
+    | "diff_worktree"
+    | "commit_worktree";
   operationId?: string;
   pid: number;
   hostname: string;
@@ -126,6 +130,30 @@ export type SunsetJson = {
   setup?: string | string[];
 };
 
+export type DiffWorktreeInput = {
+  repoRoot: string;
+  worktreePath: string;
+  baseRef?: string;
+};
+
+export type WorktreeDiff = {
+  worktreePath: string;
+  head: string;
+  diff: string;
+  stat: string;
+};
+
+export type CommitWorktreeInput = {
+  repoRoot: string;
+  worktreePath: string;
+  message: string;
+};
+
+export type WorktreeCommit = {
+  commit: string;
+  summary: string;
+};
+
 export type GitService = {
   createWorktree: (input: CreateWorktreeInput) => Promise<CreatedWorktree>;
   inspectRepository: (repoRoot: string) => Promise<RepositorySnapshot>;
@@ -134,6 +162,8 @@ export type GitService = {
   advanceWorkspaceOperation: (
     input: WorkspaceOperationStepInput,
   ) => Promise<WorkspaceOperationStepResult>;
+  diffWorktree: (input: DiffWorktreeInput) => Promise<WorktreeDiff>;
+  commitWorktree: (input: CommitWorktreeInput) => Promise<WorktreeCommit>;
 };
 
 export type CreateGitOptions = {

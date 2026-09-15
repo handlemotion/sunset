@@ -8,6 +8,18 @@ import type {
   Workspace,
 } from "./types";
 
+export type WorktreeDiff = {
+  worktreePath: string;
+  head: string;
+  diff: string;
+  stat: string;
+};
+
+export type WorktreeCommit = {
+  commit: string;
+  summary: string;
+};
+
 const params = new URLSearchParams(window.location.search);
 const token =
   params.get("token") ?? window.localStorage.getItem("sunset.token");
@@ -63,6 +75,15 @@ export const api = {
     request<Workspace>(`/api/workspaces/${workspaceId}/archive`, {
       method: "POST",
       body: JSON.stringify({ keepBranch: true }),
+    }),
+  workspaceDiff: (workspaceId: string, baseRef?: string) =>
+    request<WorktreeDiff>(
+      `/api/workspaces/${workspaceId}/diff${baseRef ? `?base=${encodeURIComponent(baseRef)}` : ""}`,
+    ),
+  commitWorkspace: (workspaceId: string, message: string) =>
+    request<WorktreeCommit>(`/api/workspaces/${workspaceId}/commit`, {
+      method: "POST",
+      body: JSON.stringify({ message }),
     }),
   listSessions: (workspaceId: string) =>
     request<{ sessions: Session[] }>(

@@ -133,6 +133,18 @@ export type ProjectReconciliation = {
   entries: ReconciliationEntry[];
 };
 
+export type WorktreeDiff = {
+  worktreePath: string;
+  head: string;
+  diff: string;
+  stat: string;
+};
+
+export type WorktreeCommit = {
+  commit: string;
+  summary: string;
+};
+
 // ---------------------------------------------------------------------------
 // Route table
 // ---------------------------------------------------------------------------
@@ -157,6 +169,14 @@ export const routes = {
   archiveWorkspace: {
     method: "POST",
     path: "/api/workspaces/:workspaceId/archive",
+  },
+  getWorkspaceDiff: {
+    method: "GET",
+    path: "/api/workspaces/:workspaceId/diff",
+  },
+  commitWorkspace: {
+    method: "POST",
+    path: "/api/workspaces/:workspaceId/commit",
   },
   listSessions: {
     method: "GET",
@@ -201,6 +221,10 @@ export type ReconcileProjectResponse = ProjectReconciliation;
 export type GetWorkspaceResponse = Workspace | null;
 export type ArchiveWorkspaceRequest = { keepBranch?: boolean };
 export type ArchiveWorkspaceResponse = Workspace;
+
+export type GetWorkspaceDiffResponse = WorktreeDiff;
+export type CommitWorkspaceRequest = { message: string };
+export type CommitWorkspaceResponse = WorktreeCommit;
 
 export type ListSessionsResponse = { sessions: Session[] };
 export type CreateSessionRequest = {

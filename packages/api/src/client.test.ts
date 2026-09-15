@@ -310,6 +310,37 @@ describe("createClient", () => {
     );
   });
 
+  it("gets a workspace diff with an optional base", async () => {
+    const diff = {
+      worktreePath: "/w",
+      head: "abc",
+      diff: "patch",
+      stat: " 1 file changed",
+    };
+    const calls = stubFetch(() => ok(diff));
+    const client = createClient({ baseUrl: BASE, token: TOKEN });
+
+    await expect(client.workspaceDiff("w1")).resolves.toEqual(diff);
+    expect(calls[0]!.url).toBe(`${BASE}/api/workspaces/w1/diff`);
+    expect(calls[0]!.method).toBe("GET");
+
+    await client.workspaceDiff("w1", "release/1.0");
+    expect(calls[1]!.url).toBe(
+      `${BASE}/api/workspaces/w1/diff?base=${encodeURIComponent("release/1.0")}`,
+    );
+  });
+
+  it("commits a workspace", async () => {
+    const calls = stubFetch(() => ok({ commit: "c1", summary: "s" }));
+    const client = createClient({ baseUrl: BASE, token: TOKEN });
+    await expect(
+      client.workspaceCommit("w1", { message: "ship it" }),
+    ).resolves.toEqual({ commit: "c1", summary: "s" });
+    expect(calls[0]!.url).toBe(`${BASE}/api/workspaces/w1/commit`);
+    expect(calls[0]!.method).toBe("POST");
+    expect(JSON.parse(calls[0]!.body!)).toEqual({ message: "ship it" });
+  });
+
   it("lists diagnostics operations", async () => {
     const calls = stubFetch(() => ok({ operations: [operation] }));
     const client = createClient({ baseUrl: BASE, token: TOKEN });

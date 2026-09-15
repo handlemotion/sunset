@@ -293,7 +293,7 @@ export async function createSunsetServer(
       }
       const input = method === "POST" ? fields(await body(request)) : {};
       const parts = pathname.split("/").filter(Boolean).slice(1);
-      await route(method, parts, input, response);
+      await route(method, parts, input, url, response);
       return;
     }
 
@@ -308,6 +308,7 @@ export async function createSunsetServer(
     method: string,
     parts: string[],
     input: Record<string, unknown>,
+    url: URL,
     response: ServerResponse,
   ): Promise<void> {
     if (method === "GET" && parts[0] === "capabilities") {
@@ -378,6 +379,27 @@ export async function createSunsetServer(
             workspaceId: parts[1],
             keepBranch: input.keepBranch !== false,
           }),
+        );
+        return;
+      }
+      if (parts[2] === "diff" && method === "GET") {
+        json(
+          response,
+          200,
+          await host.workspaces.diff({
+            workspaceId: parts[1],
+            baseRef: url.searchParams.get("base") || undefined,
+          }),
+        );
+        return;
+      }
+      if (parts[2] === "commit" && method === "POST") {
+        const message = stringField(input.message);
+        if (!message) throw new Error("message is required");
+        json(
+          response,
+          200,
+          await host.workspaces.commit({ workspaceId: parts[1], message }),
         );
         return;
       }

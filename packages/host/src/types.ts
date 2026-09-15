@@ -19,7 +19,12 @@ import type {
   SessionLocation,
   Workspace,
 } from "@sunset/domain";
-import type { GitService, GitWorktree } from "@sunset/git";
+import type {
+  GitService,
+  GitWorktree,
+  WorktreeCommit,
+  WorktreeDiff,
+} from "@sunset/git";
 
 export type {
   AgentEvent,
@@ -41,6 +46,8 @@ export type {
   SessionLocation,
   Workspace,
 };
+
+export type { WorktreeCommit, WorktreeDiff };
 
 export type HostEvent = AgentEvent & {
   workspaceId: string;
@@ -192,6 +199,24 @@ export type Host = {
       workspaceId: string;
       keepBranch?: boolean;
     }) => Promise<Workspace>;
+    /**
+     * Patch of the workspace worktree against `baseRef` (defaults to the
+     * workspace's recorded base ref), covering committed and uncommitted
+     * changes. Reads git state directly; not a durable workspace operation.
+     */
+    diff: (input: {
+      workspaceId: string;
+      baseRef?: string;
+    }) => Promise<WorktreeDiff>;
+    /**
+     * Stages all changes in the workspace worktree and commits them on the
+     * workspace branch. Recorded in git only; not a durable workspace
+     * operation, so it does not appear in diagnostics.operations.
+     */
+    commit: (input: {
+      workspaceId: string;
+      message: string;
+    }) => Promise<WorktreeCommit>;
   };
   sessions: {
     create: (input: {

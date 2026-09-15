@@ -13,11 +13,14 @@ import {
   routes,
   type AddProjectResponse,
   type ArchiveWorkspaceRequest,
+  type CommitWorkspaceRequest,
+  type CommitWorkspaceResponse,
   type CreateSessionRequest,
   type CreateSessionResponse,
   type CreateWorkspaceRequest,
   type CreateWorkspaceResponse,
   type GetRunResponse,
+  type GetWorkspaceDiffResponse,
   type GetWorkspaceResponse,
   type ListOperationsResponse,
   type ListProjectsResponse,
@@ -155,6 +158,21 @@ export function createClient(options: SunsetClientOptions) {
       workspaceId: string,
       input: ArchiveWorkspaceRequest = {},
     ) => post<Workspace>(routes.archiveWorkspace.path, { workspaceId }, input),
+
+    workspaceDiff: (workspaceId: string, baseRef?: string) =>
+      get<GetWorkspaceDiffResponse>(
+        baseRef === undefined
+          ? routes.getWorkspaceDiff.path
+          : `${routes.getWorkspaceDiff.path}?base=${encodeURIComponent(baseRef)}`,
+        { workspaceId },
+      ),
+
+    workspaceCommit: (workspaceId: string, input: CommitWorkspaceRequest) =>
+      post<CommitWorkspaceResponse>(
+        routes.commitWorkspace.path,
+        { workspaceId },
+        input,
+      ),
 
     listSessions: async (workspaceId: string) =>
       (

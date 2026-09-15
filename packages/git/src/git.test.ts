@@ -614,3 +614,138 @@ describe("createGit", () => {
     await access(path.join(worktreePath, "user-data"));
   });
 });
+
+describe("diffWorktree and commitWorktree", () => {
+  async function workspaceWorktree(
+    repo: string,
+    parent: string,
+    slug = "change",
+  ) {
+    const git = createGit();
+    const worktreePath = path.join(parent, `wt-${slug}`);
+    await git.createWorktree({
+      repoRoot: repo,
+      worktreePath,
+      slug,
+      branch: `sunset/${slug}`,
+      baseRef: "main",
+    });
+    return { git, worktreePath };
+  }
+
+  it("reports uncommitted and untracked changes against HEAD by default", async () => {
+    const { repo, parent } = await initRepo();
+    temps.push(parent);
+    const { git, worktreePath } = await workspaceWorktree(repo, parent);
+    await writeFile(path.join(worktreePath, "README.md"), "edited\n");
+    await writeFile(path.join(worktreePath, "fresh.txt"), "fresh\n");
+
+    const result = await git.diffWorktree({ repoRoot: repo, worktreePath });
+
+    expect(result.worktreePath).toBe(await realpath(worktreePath));
+    expect(result.head).toMatch(/^[0-9a-f]{40}$/);
+    expect(result.diff).toContain("README.md");
+    expect(result.diff).toContain("+edited");
+    expect(result.diff).toContain("fresh.txt");
+    expect(result.diff).toContain("+fresh");
+    expect(result.stat).toContain("fresh.txt");
+  });
+
+  it("includes committed branch changes and ignores base drift with baseRef", async () => {
+    const { repo, parent } = await initRepo();
+    temps.push(parent);
+    const { git, worktreePath } = await workspaceWorktree(repo, parent);
+    await writeFile(path.join(worktreePath, "feature.txt"), "from branch\n");
+    await execa("git", ["add", "feature.txt"], { cwd: worktreePath });
+    await execa("git", ["commit", "-m", "branch work"], { cwd: worktreePath });
+
+    const vsHead = await git.diffWorktree({ repoRoot: repo, worktreePath });
+    expect(vsHead.diff).toBe("");
+
+    // The base ref moved after the worktree branched; its commits must not
+    // appear as reverse changes in the workspace diff.
+    await writeFile(path.join(repo, "main-only.txt"), "main moved\n");
+    await execa("git", ["add", "main-only.txt"], { cwd: repo });
+    await execa("git", ["commit", "-m", "main advances"], { cwd: repo });
+
+    const vsBase = await git.diffWorktree({
+      repoRoot: repo,
+      worktreePath,
+      baseRef: "main",
+    });
+    expect(vsBase.diff).toContain("feature.txt");
+    expect(vsBase.diff).toContain("+from branch");
+    expect(vsBase.diff).not.toContain("main-only.txt");
+    expect(vsBase.stat).toContain("feature.txt");
+  });
+
+  it("stages all changes and commits them on the workspace branch", async () => {
+    const { repo, parent } = await initRepo();
+    temps.push(parent);
+    const { git, worktreePath } = await workspaceWorktree(repo, parent);
+    await writeFile(path.join(worktreePath, "README.md"), "edited\n");
+    await writeFile(path.join(worktreePath, "fresh.txt"), "fresh\n");
+
+    const result = await git.commitWorktree({
+      repoRoot: repo,
+      worktreePath,
+      message: "agent edits",
+    });
+
+    const head = await execa("git", ["rev-parse", "HEAD"], {
+      cwd: worktreePath,
+    });
+    expect(result.commit).toBe(head.stdout.trim());
+    const subject = await execa("git", ["log", "-1", "--format=%s"], {
+      cwd: worktreePath,
+    });
+    expect(subject.stdout).toBe("agent edits");
+    const branch = await execa("git", ["branch", "--show-current"], {
+      cwd: worktreePath,
+    });
+    expect(branch.stdout).toBe("sunset/change");
+    expect(result.summary).toContain("agent edits");
+    expect(result.summary).toContain("fresh.txt");
+    const status = await execa("git", ["status", "--porcelain"], {
+      cwd: worktreePath,
+    });
+    expect(status.stdout).toBe("");
+  });
+
+  it("rejects a commit when the worktree is clean or the message is empty", async () => {
+    const { repo, parent } = await initRepo();
+    temps.push(parent);
+    const { git, worktreePath } = await workspaceWorktree(repo, parent);
+
+    await expect(
+      git.commitWorktree({ repoRoot: repo, worktreePath, message: "nope" }),
+    ).rejects.toMatchObject({ code: "nothing_to_commit" });
+    await expect(
+      git.commitWorktree({ repoRoot: repo, worktreePath, message: "  " }),
+    ).rejects.toMatchObject({ code: "invalid_options" });
+  });
+
+  it("rejects paths that are not worktrees of the repository", async () => {
+    const { repo, parent } = await initRepo();
+    temps.push(parent);
+    const other = await initRepo();
+    temps.push(other.parent);
+    const git = createGit();
+    const stray = path.join(parent, "stray");
+    await mkdir(stray);
+
+    await expect(
+      git.diffWorktree({ repoRoot: repo, worktreePath: stray }),
+    ).rejects.toMatchObject({ code: "worktree_not_found" });
+    await expect(
+      git.diffWorktree({ repoRoot: repo, worktreePath: repo }),
+    ).rejects.toMatchObject({ code: "nested_worktree" });
+    await expect(
+      git.commitWorktree({
+        repoRoot: repo,
+        worktreePath: other.repo,
+        message: "x",
+      }),
+    ).rejects.toMatchObject({ code: "worktree_not_found" });
+  });
+});

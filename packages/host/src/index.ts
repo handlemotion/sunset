@@ -35,4 +35,6 @@ export type {
   WorkspaceOperationPhase,
   WorkspaceOperationTerminalOutcome,
   WorkspaceOperationType,
+  WorktreeCommit,
+  WorktreeDiff,
 } from "./types.js";

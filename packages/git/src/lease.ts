@@ -36,7 +36,9 @@ function isOwner(value: unknown): value is RepositoryLeaseOwner {
     typeof candidate.repositoryIdentity === "string" &&
     (candidate.operation === "create_worktree" ||
       candidate.operation === "archive_worktree" ||
-      candidate.operation === "recover_workspace_operation") &&
+      candidate.operation === "recover_workspace_operation" ||
+      candidate.operation === "diff_worktree" ||
+      candidate.operation === "commit_worktree") &&
     (candidate.operationId === undefined ||
       typeof candidate.operationId === "string") &&
     typeof candidate.pid === "number" &&
