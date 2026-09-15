@@ -1,3 +1,6 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
+
 import {
   agent as acpAgent,
   client as acpClient,
@@ -21,14 +24,21 @@ export type FakeAcpAuthenticate = {
   methodId?: string;
   /** Fail this many `authenticate` calls per connection before succeeding. */
   failTimes?: number;
-  /** Error thrown for each failure (default: an auth-required error). */
-  error?: Error;
+  /**
+   * Error thrown for each failure (default: an auth-required error). A string
+   * becomes the message of an internal error so spawned-agent option JSON can
+   * carry it.
+   */
+  error?: Error | string;
 };
 
 /** `session/resume` or `session/load` outcome: success by default. */
 export type FakeAcpLoadFailure = {
-  /** `"auth"` throws an auth-required error; an Error is thrown as-is. */
-  error?: Error | "auth";
+  /**
+   * `"auth"` throws an auth-required error; an Error is thrown as-is; any
+   * other string becomes the message of an internal error.
+   */
+  error?: Error | "auth" | string;
 };
 
 /** Model state returned in the `session/new` response (codex-style). */
@@ -47,8 +57,11 @@ export type FakeAcpPrompt = {
   updates?: SessionUpdate[];
   /** Stop reason returned when the turn completes (default "end_turn"). */
   stopReason?: StopReason;
-  /** Throw this after emitting the updates instead of returning stopReason. */
-  error?: Error;
+  /**
+   * Throw this after emitting the updates instead of returning stopReason.
+   * A string becomes the message of an internal error.
+   */
+  error?: Error | string;
   /** Hold the turn open until `session/cancel`, then answer "cancelled". */
   waitForCancel?: boolean;
 };
@@ -72,6 +85,12 @@ export type FakeAcpAgentOptions = {
   resume?: FakeAcpLoadFailure;
   load?: FakeAcpLoadFailure;
   prompt?: FakeAcpPrompt;
+  /**
+   * Files written during `session/prompt`, relative to the session cwd the
+   * client sent in `session/new` (or resume/load). Written after the scripted
+   * updates are emitted; a cancelled turn writes nothing.
+   */
+  writes?: Record<string, string>;
   /** These methods accept the request but never answer it. */
   hangOn?: string[];
   /** Requests for these methods return JSON-RPC method-not-found errors. */
@@ -125,10 +144,53 @@ const authError = (): RequestError =>
 
 // Plain Error messages do not cross the JSON-RPC boundary — the client only
 // sees "Internal error". Wrap them so configured failure messages survive.
-const asRpcError = (error: Error): RequestError =>
+const asRpcError = (error: Error | string): RequestError =>
   error instanceof RequestError
     ? error
-    : RequestError.internalError(undefined, error.message);
+    : RequestError.internalError(
+        undefined,
+        error instanceof Error ? error.message : error,
+      );
+
+/** `cwd` travels in session/new, session/resume, and session/load params. */
+const paramsCwd = (params: unknown): string | undefined =>
+  typeof params === "object" &&
+  params !== null &&
+  typeof (params as { cwd?: unknown }).cwd === "string"
+    ? (params as { cwd: string }).cwd
+    : undefined;
+
+/** Write `writes` entries under the session cwd, refusing escapes. */
+async function writeSessionFiles(
+  cwd: string | undefined,
+  writes: Record<string, string>,
+): Promise<void> {
+  if (cwd === undefined) {
+    throw RequestError.internalError(
+      undefined,
+      "writes configured but the session cwd is unknown",
+    );
+  }
+  const root = path.resolve(cwd);
+  for (const [name, content] of Object.entries(writes)) {
+    const target = path.resolve(root, name);
+    if (target !== root && !target.startsWith(`${root}${path.sep}`)) {
+      throw RequestError.internalError(
+        undefined,
+        `writes path escapes the session cwd: ${name}`,
+      );
+    }
+    try {
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(target, content, "utf8");
+    } catch (error) {
+      throw RequestError.internalError(
+        undefined,
+        `fake write failed for ${name}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+}
 
 export function fakeAcpAgent(options: FakeAcpAgentOptions = {}): FakeAcpAgent {
   const calls: FakeAcpCall[] = [];
@@ -143,6 +205,7 @@ export function fakeAcpAgent(options: FakeAcpAgentOptions = {}): FakeAcpAgent {
     const app = acpAgent({ name: options.name ?? "fake-acp" });
     const conn = {
       ref: null as AgentConnection | null,
+      cwd: undefined as string | undefined,
       authenticated: false,
       authenticateCalls: 0,
       exited: false,
@@ -239,6 +302,7 @@ export function fakeAcpAgent(options: FakeAcpAgentOptions = {}): FakeAcpAgent {
       receive("session/new", ctx.params);
       if (hanging("session/new")) return hang(ctx.signal);
       requireAuth();
+      conn.cwd = paramsCwd(ctx.params) ?? conn.cwd;
       maybeExit("session/new");
       return {
         sessionId: options.sessionId ?? "fake-session-1",
@@ -251,6 +315,7 @@ export function fakeAcpAgent(options: FakeAcpAgentOptions = {}): FakeAcpAgent {
       receive("session/resume", ctx.params);
       if (hanging("session/resume")) return hang(ctx.signal);
       requireAuth();
+      conn.cwd = paramsCwd(ctx.params) ?? conn.cwd;
       failIf(options.resume);
       maybeExit("session/resume");
       return {};
@@ -260,6 +325,7 @@ export function fakeAcpAgent(options: FakeAcpAgentOptions = {}): FakeAcpAgent {
       receive("session/load", ctx.params);
       if (hanging("session/load")) return hang(ctx.signal);
       requireAuth();
+      conn.cwd = paramsCwd(ctx.params) ?? conn.cwd;
       failIf(options.load);
       maybeExit("session/load");
       return {};
@@ -316,6 +382,7 @@ export function fakeAcpAgent(options: FakeAcpAgentOptions = {}): FakeAcpAgent {
           maybeExit("session/prompt");
           return { stopReason: "cancelled" };
         }
+        if (options.writes) await writeSessionFiles(conn.cwd, options.writes);
         if (options.prompt?.error) throw asRpcError(options.prompt.error);
         maybeExit("session/prompt");
         return { stopReason: options.prompt?.stopReason ?? "end_turn" };

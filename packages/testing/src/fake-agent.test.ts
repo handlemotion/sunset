@@ -1,3 +1,7 @@
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import type { SessionUpdate } from "@agentclientprotocol/sdk";
@@ -339,6 +343,44 @@ describe("fakeAcpAgent over createEngine", () => {
     expect(result.status).toBe("error");
     expect(events).toEqual([{ type: "text_delta", text: "first" }]);
     await session.dispose();
+  });
+
+  it("writes configured files into the session cwd during prompt", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "sunset-fake-writes-"));
+    try {
+      const fake = fakeAcpAgent({
+        writes: { "out/result.txt": "done\n", "notes.md": "# notes\n" },
+      });
+      const engine = createEngine(ENGINES.devin, { connector: fake.connector });
+      const session = await engine.create({ ...createInput, cwd: dir });
+      const run = await session.send("work");
+      expect((await run.wait()).status).toBe("finished");
+      expect(await readFile(path.join(dir, "out/result.txt"), "utf8")).toBe(
+        "done\n",
+      );
+      expect(await readFile(path.join(dir, "notes.md"), "utf8")).toBe(
+        "# notes\n",
+      );
+      await session.dispose();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects writes that escape the session cwd", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "sunset-fake-writes-"));
+    try {
+      const fake = fakeAcpAgent({ writes: { "../escape.txt": "nope\n" } });
+      const engine = createEngine(ENGINES.devin, { connector: fake.connector });
+      const session = await engine.create({ ...createInput, cwd: dir });
+      const run = await session.send("work");
+      const result = await run.wait();
+      expect(result.status).toBe("error");
+      expect(result.error?.message).toContain("escapes the session cwd");
+      await session.dispose();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it("fails create when the agent does not implement session/new", async () => {
