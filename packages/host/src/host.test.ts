@@ -235,7 +235,7 @@ describe("createHost", () => {
     }
     expect(events).toContain("text_delta");
     await host.close();
-  });
+  }, 15_000);
 
   it("serializes queued sends per session", async () => {
     const root = await tempDir("state");

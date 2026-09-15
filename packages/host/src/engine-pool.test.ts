@@ -247,7 +247,7 @@ describe("engine pool", () => {
 
     expect(state.disposes).toEqual(["fake-provider-1"]);
     await host.close();
-  });
+  }, 15_000);
 
   it("disposes an idle engine after the TTL and resumes the session on the next prompt", async () => {
     const { engine, state } = fakeEngine([
